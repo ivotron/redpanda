@@ -1,0 +1,29 @@
+name: slash test trigger
+on: issue_comment
+jobs:
+  check_comments:
+    name: check comments for /test
+    runs-on: ubuntu-latest
+    steps:
+    - name: initialize command spec
+      run: |
+        echo "" > command_args
+
+    - name: check for /test in comment
+      id: command
+      uses: xt0rted/slash-command-action@v1
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+        command: test
+        allow-edits: "false"
+        permission-level: write
+
+    - name: write command args
+      run: |
+        echo "${{ steps.command.outputs.command-arguments }}" > command_args
+
+    - name: upload as artifact
+      if: always()
+      uses: actions/upload-artifact@v2
+      with:
+        path: command_args
