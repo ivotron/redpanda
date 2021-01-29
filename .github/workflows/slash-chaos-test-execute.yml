@@ -1,18 +1,32 @@
-name: consistency_testing
+name: process slash chaos-test
 on:
-  repository_dispatch:
-    types: [chaos-test-command]
-
+  workflow_run:
+    workflows: ["slash chaos-test"]
 jobs:
-  run_consistency_tests:
+  load_command:
     runs-on: ubuntu-20.04
+    steps:
+    - name: download command definition
+      uses: dawidd6/action-download-artifact@v2
+      with:
+        workflow: slash-chaos-test-trigger.yml
+
+    - name: load commands
+      run: |
+        echo "COMMAND_NAME=$(cat command/name)" >> $GITHUB_ENV
+        echo "COMMAND_ARGS=$(cat command/args)" >> $GITHUB_ENV
+
+  run_command:
+    runs-on: ubuntu-20.04
+    needs: load_command
+    if: "env.COMMAND_NAME == 'chaos-test'"
+    steps:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       CI: 1
       CI_INSTALL_INFRA: 1
       AWS_EC2_METADATA_DISABLED: true
-
     steps:
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@master
