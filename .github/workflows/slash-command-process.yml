@@ -1,0 +1,30 @@
+name: process slash command
+on:
+  workflow_run:
+    workflows: ["slash chaos"]
+jobs:
+  load_command:
+    runs-on: ubuntu-latest
+    steps:
+    - name: download command definition
+      uses: actions/download-artifact@v2
+      with:
+        name: command
+
+    - name: load commands
+      run: |
+        echo "COMMAND_NAME=$(cat command/name)" >> $GITHUB_ENV
+        echo "COMMAND_ARGS=$(cat command/args)" >> $GITHUB_ENV
+
+    - name: install vtools
+      if: "env.COMMAND_NAME != ''"
+      run: echo "INSTALL VTOOLS"
+
+    - name: execute command
+      if: "env.COMMAND_NAME != ''"
+      run: |
+        echo "vtools ci trigger \
+                --github-context '${{ github }}' \
+                --notify true \
+                ${{ env.COMMAND_NAME }} \
+                '${{ env.COMMAND_ARGS }}'"
