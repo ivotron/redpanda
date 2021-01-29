@@ -6,20 +6,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: initialize command spec
-      run: echo "{}" > command.json
+      run: |
+        mkdir command/
+        echo "" > command/name
+        echo "" > command/args
 
     - name: check for command
       id: command
       uses: xt0rted/slash-command-action@v1
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
-        command: chaos-test
+        command: chaos
         allow-edits: "false"
         permission-level: write
 
     - name: write command spec
       run: |
-        mkdir command/
         echo "${{ steps.command.outputs.command-name }}" > command/name
         echo "${{ steps.command.outputs.command-arguments }}" > command/args
 
