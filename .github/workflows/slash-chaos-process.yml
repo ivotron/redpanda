@@ -6,10 +6,11 @@ jobs:
   load_command:
     runs-on: ubuntu-latest
     steps:
-    - name: download command definition
-      uses: actions/download-artifact@v2
-      with:
-        name: command
+    steps:
+      - name: download command definition
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: slash-chaos-dispatch.yml
 
     - name: load commands
       run: |
