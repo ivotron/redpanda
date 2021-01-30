@@ -16,10 +16,32 @@ jobs:
         echo "COMMAND_ARGS=$(cat command/args)" >> $GITHUB_ENV
         echo "${{ github.event.client_payload.pull_request.head.sha }}"
 
+  run_test_ducky:
+    runs-on: ubuntu-20.10
+    needs: load_command
+    if: env.COMMAND_NAME == 'test' and contains(env.COMMAND_ARGS, 'ducky')
+    steps:
+    - name: checkout
+      uses: actions/checkout@v2
+
+    - name: setup vtools
+      run: |
+        sudo apt-get install python3-pip
+        pip install --upgrade pip
+        pip install --depth 5 --branch release git+https://${{ secrets.vtools_github_api_token }}@github.com/vectorizedio/vtools > vtools_out.log 2>&1
+
+    - name: run ducky test
+      run: |
+        vtools install java
+        vtools install maven
+        vtools build java
+        vtools deploy cluster --provider docker-compose nodes=4
+        vtools deploy cluster --provider docker-compose --destroy
+
   run_test_chaos:
     runs-on: ubuntu-20.10
     needs: load_command
-    if: "env.COMMAND_NAME == 'test'" and "contains(env.COMMAND_ARGS, 'chaos')"
+    if: env.COMMAND_NAME == 'test' and contains(env.COMMAND_ARGS, 'chaos')
     steps:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -106,25 +128,3 @@ jobs:
           body: |
             Chaos test status: ${{ steps.run-tests.conclusion }}
             Run: https://github.com/vectorizedio/redpanda/actions/runs/${{ github.run_id }}
-
-  run_test_ducky:
-    runs-on: ubuntu-20.10
-    needs: load_command
-    if: "env.COMMAND_NAME == 'test'" and "contains(env.COMMAND_ARGS, 'ducky')"
-    steps:
-    - name: checkout
-      uses: actions/checkout@v2
-
-    - name: setup vtools
-      run: |
-        sudo apt-get install python3-pip
-        pip install --upgrade pip
-        pip install --depth 5 --branch release git+https://${{ secrets.vtools_github_api_token }}@github.com/vectorizedio/vtools > vtools_out.log 2>&1
-
-    - name: run ducky test
-      run: |
-        vtools install java
-        vtools install maven
-        vtools build java
-        vtools deploy cluster --provider docker-compose nodes=4
-        vtools deploy cluster --provider docker-compose --destroy
