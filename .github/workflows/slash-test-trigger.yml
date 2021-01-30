@@ -1,4 +1,4 @@
-name: slash test
+name: trigger slash test
 on: issue_comment
 jobs:
   check_comments:

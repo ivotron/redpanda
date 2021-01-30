@@ -1,7 +1,7 @@
 name: process slash test
 on:
   workflow_run:
-    workflows: ["slash test"]
+    workflows: ["trigger slash test"]
 jobs:
   load_command:
     runs-on: ubuntu-20.10
@@ -42,7 +42,6 @@ jobs:
     runs-on: ubuntu-20.10
     needs: load_command
     if: env.COMMAND_NAME == 'test' and contains(env.COMMAND_ARGS, 'chaos')
-    steps:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
