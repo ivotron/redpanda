@@ -1,8 +1,8 @@
-name: slash chaos-test
+name: slash test
 on: issue_comment
 jobs:
   check_comments:
-    name: check comments for /chaos-test
+    name: check comments for /test
     runs-on: ubuntu-latest
     steps:
     - name: initialize command spec
@@ -11,12 +11,12 @@ jobs:
         echo "" > command/name
         echo "" > command/args
 
-    - name: check for /chaos-test in comment
+    - name: check for /test in comment
       id: command
       uses: xt0rted/slash-command-action@v1
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
-        command: chaos-test
+        command: test
         allow-edits: "false"
         permission-level: write
 
