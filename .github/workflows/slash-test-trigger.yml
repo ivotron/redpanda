@@ -7,9 +7,7 @@ jobs:
     steps:
     - name: initialize command spec
       run: |
-        mkdir command/
-        echo "" > command/name
-        echo "" > command/args
+        echo "" > command_args
 
     - name: check for /test in comment
       id: command
@@ -20,14 +18,12 @@ jobs:
         allow-edits: "false"
         permission-level: write
 
-    - name: write command spec
+    - name: write command args
       run: |
-        echo "${{ steps.command.outputs.command-name }}" > command/name
-        echo "${{ steps.command.outputs.command-arguments }}" > command/args
+        echo "${{ steps.command.outputs.command-arguments }}" > command_args
 
     - name: upload as artifact
       if: always()
       uses: actions/upload-artifact@v2
       with:
-        name: command
-        path: command/
+        path: command_args
