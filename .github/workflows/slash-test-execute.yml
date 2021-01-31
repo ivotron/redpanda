@@ -6,17 +6,17 @@ jobs:
   load_command:
     runs-on: ubuntu-20.04
     outputs:
-      cmd_args: ${{ steps.set_args.outputs.cmd_args }}
+      cmd_args: ${{ steps.set_cmd_args.outputs.cmd_args }}
     steps:
     - name: download command definition
       uses: dawidd6/action-download-artifact@v2
       with:
         workflow: slash-test-trigger.yml
     - name: set command args
-      id: set_args
+      id: set_cmd_args
       run: |
-        echo "args: $(cat cmd_args)"
-        echo "::set-output name=cmd_args::$(cat cmd_args)"
+        echo "args: $(cat artifact/cmd_args)"
+        echo "::set-output name=cmd_args::$(cat artifact/cmd_args)"
         echo "COMMIT: ${{ github.event.client_payload.pull_request.head.sha }}"
 
   run_ducky:
