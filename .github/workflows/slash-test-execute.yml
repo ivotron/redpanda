@@ -1,7 +1,7 @@
-name: process slash test
+name: slash test execution
 on:
   workflow_run:
-    workflows: ["trigger slash test"]
+    workflows: ["slash test trigger"]
 jobs:
   load_command:
     runs-on: ubuntu-20.10
@@ -10,26 +10,24 @@ jobs:
       uses: dawidd6/action-download-artifact@v2
       with:
         workflow: slash-test-trigger.yml
-    - name: load commands
+    - name: process commands
       run: |
-        echo "COMMAND_NAME=$(cat command/name)" >> $GITHUB_ENV
-        echo "COMMAND_ARGS=$(cat command/args)" >> $GITHUB_ENV
-        echo "${{ github.event.client_payload.pull_request.head.sha }}"
+        echo "::set-output name=cmd_name::$(cat command/name)"
+        echo "::set-output name=cmd_args::$(cat command/args)"
+        echo "COMMIT: ${{ github.event.client_payload.pull_request.head.sha }}"
 
-  run_test_ducky:
+  run_ducky:
     runs-on: ubuntu-20.10
     needs: load_command
-    if: jobs.load_command.env.COMMAND_NAME == 'test' and contains(jobs.load_command.env.COMMAND_ARGS, 'ducky')
+    if: needs.load_command.outputs.cmd_name == 'test' and contains(needs.load_cmd.outputs.command_args, 'ducky')
     steps:
     - name: checkout
       uses: actions/checkout@v2
-
     - name: setup vtools
       run: |
         sudo apt-get install python3-pip
         pip install --upgrade pip
-        pip install --depth 5 --branch release git+https://${{ secrets.vtools_github_api_token }}@github.com/vectorizedio/vtools > vtools_out.log 2>&1
-
+        pip install git+https://${{ secrets.vtools_github_api_token }}@github.com/vectorizedio/vtools > vtools_out.log 2>&1
     - name: run ducky test
       run: |
         vtools install java
@@ -41,7 +39,7 @@ jobs:
   run_test_chaos:
     runs-on: ubuntu-20.10
     needs: load_command
-    if: jobs.load_command.env.COMMAND_NAME == 'test' and contains(jobs.load_command.env.COMMAND_ARGS, 'chaos')
+    if: needs.load_command.outputs.cmd_name == 'test' and contains(needs.load_cmd.outputs.command_args, 'chaos')
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
