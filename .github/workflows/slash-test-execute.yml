@@ -19,7 +19,7 @@ jobs:
   run_ducky:
     runs-on: ubuntu-20.10
     needs: load_command
-    if: needs.load_command.outputs.cmd_name == 'test' and contains(needs.load_cmd.outputs.command_args, 'ducky')
+    if: needs.load_command.outputs.cmd_name == 'test' && contains(needs.load_cmd.outputs.command_args, 'ducky')
     steps:
     - name: checkout
       uses: actions/checkout@v2
@@ -39,7 +39,7 @@ jobs:
   run_test_chaos:
     runs-on: ubuntu-20.10
     needs: load_command
-    if: needs.load_command.outputs.cmd_name == 'test' and contains(needs.load_cmd.outputs.command_args, 'chaos')
+    if: needs.load_command.outputs.cmd_name == 'test' && contains(needs.load_cmd.outputs.command_args, 'chaos')
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
