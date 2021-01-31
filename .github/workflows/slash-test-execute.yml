@@ -5,8 +5,12 @@ on:
 jobs:
   load_command:
     runs-on: ubuntu-20.04
+    outputs:
+      cmd_name: ${{ steps.read_command_name_args.outputs.cmd_name }}
+      cmd_args: ${{ steps.read_command_name_args.outputs.cmd_args }}
     steps:
     - name: download command definition
+      id: read_command_name_args
       uses: dawidd6/action-download-artifact@v2
       with:
         workflow: slash-test-trigger.yml
