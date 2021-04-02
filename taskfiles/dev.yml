@@ -106,6 +106,28 @@ tasks:
     status:
     - test -d '{{.BUILD_ROOT}}/deployment-automation/.git/'
 
+  allocate-aws-nodes:
+    desc: allocate VMs on AWS
+    deps:
+    - install-terraform
+    - clone-deployment-automation
+    env:
+      TF_IN_AUTOMATION: true
+      TF_WORKSPACE: '{{default "aws-default" .TF_WORKSPACE}}'
+    vars:
+      TF_APPLY_FLAGS: '{{default "-var=nodes=4" .TF_APPLY_FLAGS}}'
+    cmds:
+    - |
+      PATH="{{.BUILD_ROOT}}/tf/bin/:$PATH"
+      cd '{{.BUILD_ROOT}}/deployment-automation/gcp/'
+      #terraform init
+      #terraform plan
+      #terraform apply '{{.TF_APPLY_FLAGS}}'
+    preconditions:
+    - test -n "$AWS_ACCESS_KEY_ID"
+    - test -n "$AWS_SECRET_ACCESS_KEY"
+    - test -n "$AWS_DEFAULT_REGION"
+
   start-podman-socket-service:
     desc: start podman socket service (requires sudo)
     cmds:
