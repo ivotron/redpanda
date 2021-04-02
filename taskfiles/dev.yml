@@ -85,6 +85,27 @@ tasks:
     status:
     - test -f '{{.BUILD_ROOT}}/bin/docker-compose'
 
+  install-terraform:
+    desc: install terraform
+    vars:
+      TF_URL: https://releases.hashicorp.com/terraform/1.0.0/terraform_1.0.0_linux_{{ARCH}}.zip
+    cmds:
+    - mkdir -p '{{.BUILD_ROOT}}/tf/bin'
+    - cd '{{.BUILD_ROOT}}/tf/bin' && curl -LO '{{.TF_URL}}'
+    - cd '{{.BUILD_ROOT}}/tf/bin' && unzip '{{.BUILD_ROOT}}/tf/bin/*.zip'
+    - rm "{{.BUILD_ROOT}}/tf/bin/"*.zip
+    status:
+    - test -f '{{.BUILD_ROOT}}/tf/bin/terraform'
+
+  clone-deployment-automation-repo:
+    desc: clone deployment automation repo
+    cmds:
+    - git clone
+        https://github.com/vectorizedio/deployment-automation
+        '{{.BUILD_ROOT}}/deployment-automation'
+    status:
+    - test -d '{{.BUILD_ROOT}}/deployment-automation/.git/'
+
   start-podman-socket-service:
     desc: start podman socket service (requires sudo)
     cmds:
