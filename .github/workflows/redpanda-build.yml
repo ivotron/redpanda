@@ -12,47 +12,40 @@ on: [push, pull_request]
 
 jobs:
   build:
-    name: Build on ${{ matrix.container }}
+    name: Build
     runs-on: ubuntu-20.04
-    container: ${{ matrix.container }}
-    strategy:
-      matrix:
-        container: ['ubuntu:21.04']
+    container:
+      image: ubuntu:21.04
 
     steps:
         - name: checkout
           uses: actions/checkout@v2
 
-        - name: update container base
-          run: |
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y
-            apt-get install -y git sudo pkg-config ccache
-
         - name: install dependencies
-          run: ./install-dependencies.sh
+          run: |
+            apt update
+            apt install git pkg-config ccache -y
+            ./install-dependencies.sh
 
         - name: install g++-11
           run: |
-            DEBIAN_FRONTEND=noninteractive apt install -y g++-11
-            sudo update-alternatives \
+            apt install software-properties-common -y
+            add-apt-repository ppa:ubuntu-toolchain-r/test
+            apt update
+            apt install g++-11 -y
+            update-alternatives \
               --install /usr/bin/gcc gcc /usr/bin/gcc-11 60 \
               --slave /usr/bin/g++ g++ /usr/bin/g++-11
-            sudo update-alternatives --auto gcc
-
-        # there is no analog to ${{ github.workspace }} for the home directory
-        - name: prepare cache variables
-          id: prepare_cache_variables
-          run: |
-            echo ::set-output name=home::$HOME
-            echo ::set-output name=timestamp::$(date +'%Y-%m-%d-%H-%M-%S')
+            update-alternatives --auto gcc
 
         - name: ccache cache files
           uses: actions/cache@v2
           with:
-            path: ${{ steps.prepare_cache_variables.outputs.home }}/.ccache
-            key: ${{ matrix.container }}-ccache-${{ steps.prepare_cache_variables.outputs.timestamp }}
-            restore-keys: ${{ matrix.container }}-ccache-
+            path: ~/.ccache
+            key: redpanda-ccache-${{ github.ref }}-${{ github.run_id }}
+            restore-keys: |
+              redpanda-ccache-${{ github.ref }}
+              redpanda-ccache
 
         # at the time of this writing the ccache for a full build is about
         # 70MB (due to the compression) but it may grow if there are many
@@ -62,6 +55,7 @@ jobs:
             export CCACHE_COMPRESS=true
             export CCACHE_COMPRESSLEVEL=6
             export CCACHE_MAXSIZE=200M
+            export CCACHE_DIR="~/.ccache"
 
             ccache -p # print the config
             ccache -s # print the stats before reusing
