@@ -54,11 +54,12 @@ class SchemaRegistryTest(RedpandaTest):
             extra_rp_conf={"auto_create_topics_enabled": False},
             num_cores=1)
 
-        http.client.HTTPConnection.debuglevel = 1
-        logging.basicConfig()
-        requests_log = logging.getLogger("requests.packages.urllib3")
-        requests_log.setLevel(logging.getLogger().level)
-        requests_log.propagate = True
+        if logging.root.level == logging.DEBUG:
+            http.client.HTTPConnection.debuglevel = 1
+            logging.basicConfig()
+            requests_log = logging.getLogger("requests.packages.urllib3")
+            requests_log.setLevel(logging.getLogger().level)
+            requests_log.propagate = True
 
         self._ctx = context
 
@@ -726,7 +727,7 @@ class SchemaRegistryTest(RedpandaTest):
                 ssh_output = node.account.ssh_capture(
                     f"{python} {dest_path} {' '.join(node_names)}")
                 for line in ssh_output:
-                    logger.info(line)
+                    logger.debug(line)
 
             def clean_nodes(selfself, nodes):
                 # Remove our remote script
