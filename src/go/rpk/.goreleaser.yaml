@@ -33,7 +33,7 @@ builds:
             - QUILL_LOG_FILE=dist/quill-{{ .Target }}.log
 release:
   github:
-    owner: redpanda-data
+    owner: ivotron
     name: redpanda
   draft: true
   discussion_category_name: Releases
@@ -42,7 +42,7 @@ brews:
     homepage: "https://redpanda.com"
     description: "Redpanda CLI & toolbox"
     tap:
-      owner: redpanda-data
+      owner: ivotron
       name: homebrew-tap
     folder: Formula
     skip_upload: auto
