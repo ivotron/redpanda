@@ -1,0 +1,34 @@
+# Copyright 2023 Redpanda Data, Inc.
+#
+# Use of this software is governed by the Business Source License
+# included in the file licenses/BSL.md
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0
+
+name: redpanda-push-bk-dispatch
+on:
+  push:
+    branches:
+      - dev
+      - 'v[0-9][0-9].[0-9].[0-9]+'
+
+jobs:
+  redpanda-push-bk-dispatch:
+    name: Dispatch event to trigger BK pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - name: redpanda buildkite job dispatch
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          event-type: redpanda-bk-trigger
+          client-payload: |
+            {
+              "branch": "${{ github.actor }}:${{ github.ref_name }}",
+              "commit": "${{ github.event.client_payload.push.after }}",
+              "message": "${{ github.event.client_payload.push.head_commit.message }}",
+              "pull_request_base_branch": ''",
+              "pull_request_id": ''",
+              "pull_request_repository": ''"
+            }

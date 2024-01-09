@@ -1,0 +1,30 @@
+# Copyright 2023 Redpanda Data, Inc.
+#
+# Use of this software is governed by the Business Source License
+# included in the file licenses/BSL.md
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0
+
+name: trigger-redpanda-bk
+on:
+  repository_dispatch:
+    types: [redpanda-bk-trigger]
+
+jobs:
+  trigger-buildkite:
+    name: Trigger redpanda pipeline on buildkite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger a Buildkite Build
+        uses: "buildkite/trigger-pipeline-action@v2.0.0"
+        with:
+          buildkite_api_access_token: ${{ secrets.BUILDKITE_TOKEN }}
+          pipeline: redpanda/redpanda-dev
+          branch: ${{ github.event.client_payload.branch }}
+          commit: ${{ github.event.client_payload.commit }}
+          message: ${{ github.event.client_payload.message }}
+          pull_request_base_branch: ${{ github.event.client_payload.pull_request_base_branch }}
+          pull_request_id: ${{ github.event.client_payload.pull_request_id }}
+          pull_request_repository: ${{ github.event.client_payload.pull_request_repo }}
