@@ -3,6 +3,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 add_compile_options(-Wall)
 
+
 #
 # When enabled clang-tidy will be invoked along side the compiler, and
 # clang-tidy warnings will be reported as errors.
