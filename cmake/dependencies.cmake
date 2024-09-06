@@ -51,13 +51,18 @@ fetch_dep(seastar
 
 fetch_dep(avro
   REPO https://github.com/redpanda-data/avro
-  TAG release-1.11.1-redpanda
+  TAG release-1.12.0-redpanda
   SOURCE_SUBDIR redpanda_build)
 
 fetch_dep(rapidjson
   REPO https://github.com/redpanda-data/rapidjson.git
   TAG 14a5dd756e9bef26f9b53d3b4eb1b73c6a1794d5
   SOURCE_SUBDIR redpanda_build)
+
+FetchContent_Declare(jsoncons
+  URL https://github.com/danielaparker/jsoncons/archive/ffd2540bc9cfb54c16ef4d29d80622605d8dfbe8.tar.gz
+  URL_HASH MD5=8984d54668cdeb924fe1e37ea8dcc236
+  OVERRIDE_FIND_PACKAGE)
 
 fetch_dep(unordered_dense
   REPO https://github.com/redpanda-data/unordered_dense
@@ -142,7 +147,8 @@ FetchContent_MakeAvailable(
     wasmtime
     hdrhistogram
     ada
-    unordered_dense)
+    unordered_dense
+    jsoncons)
 
 add_library(Crc32c::crc32c ALIAS crc32c)
 add_library(aklomp::base64 ALIAS base64)

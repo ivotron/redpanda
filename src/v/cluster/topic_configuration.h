@@ -10,6 +10,9 @@
 
 #include "cluster/topic_properties.h"
 #include "model/metadata.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/scalar.h"
 #include "storage/ntp_config.h"
 
 namespace cluster {
@@ -19,16 +22,18 @@ namespace cluster {
 struct topic_configuration
   : serde::envelope<
       topic_configuration,
-      serde::version<1>,
+      serde::version<2>,
       serde::compat_version<0>> {
     topic_configuration(
       model::ns ns,
       model::topic topic,
       int32_t partition_count,
-      int16_t replication_factor)
+      int16_t replication_factor,
+      bool is_migrated = false)
       : tp_ns(std::move(ns), std::move(topic))
       , partition_count(partition_count)
-      , replication_factor(replication_factor) {}
+      , replication_factor(replication_factor)
+      , is_migrated(is_migrated) {}
 
     topic_configuration() = default;
 
@@ -48,17 +53,30 @@ struct topic_configuration
     bool is_recovery_enabled() const {
         return properties.recovery && properties.recovery.value();
     }
+    bool has_remote_topic_namespace_override() const {
+        return properties.remote_topic_namespace_override.has_value();
+    }
+
+    const model::topic_namespace& remote_tp_ns() const {
+        if (has_remote_topic_namespace_override()) {
+            return properties.remote_topic_namespace_override.value();
+        }
+        return tp_ns;
+    }
 
     model::topic_namespace tp_ns;
     // using signed integer because Kafka protocol defines it as signed int
-    int32_t partition_count;
+    int32_t partition_count{0};
     // using signed integer because Kafka protocol defines it as signed int
-    int16_t replication_factor;
+    int16_t replication_factor{0};
+    // bypass migration restrictions
+    bool is_migrated{false};
 
     topic_properties properties;
 
     auto serde_fields() {
-        return std::tie(tp_ns, partition_count, replication_factor, properties);
+        return std::tie(
+          tp_ns, partition_count, replication_factor, properties, is_migrated);
     }
 
     void serde_read(iobuf_parser& in, const serde::header& h) {
@@ -68,6 +86,11 @@ struct topic_configuration
         partition_count = read_nested<int32_t>(in, h._bytes_left_limit);
         replication_factor = read_nested<int16_t>(in, h._bytes_left_limit);
         properties = read_nested<topic_properties>(in, h._bytes_left_limit);
+        if (h._version >= 2) {
+            is_migrated = read_nested<bool>(in, h._bytes_left_limit);
+        } else {
+            is_migrated = false;
+        }
 
         if (h._version < 1) {
             // Legacy tiered storage topics do not delete data on

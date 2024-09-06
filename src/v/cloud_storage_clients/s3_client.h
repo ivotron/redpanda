@@ -178,7 +178,8 @@ public:
       object_key const& key,
       size_t payload_size,
       ss::input_stream<char> body,
-      ss::lowres_clock::duration timeout) override;
+      ss::lowres_clock::duration timeout,
+      bool accept_no_content = false) override;
 
     ss::future<result<list_bucket_result, error_outcome>> list_objects(
       const bucket_name& name,
@@ -218,7 +219,8 @@ private:
       object_key const& key,
       size_t payload_size,
       ss::input_stream<char> body,
-      ss::lowres_clock::duration timeout);
+      ss::lowres_clock::duration timeout,
+      bool accept_no_content = false);
 
     ss::future<list_bucket_result> do_list_objects_v2(
       const bucket_name& name,
@@ -246,14 +248,11 @@ private:
       const bucket_name& bucket,
       const object_key& key);
 
-    // Performs testing as part of the self-configuration step.
-    // If remote_read is true, the test will use list_objects().
-    // If remote_read is false, the test will instead use put_object() and
-    // delete_object(). If both remote_read and remote_write are false, the test
-    // will fail a vassert() call.
-    // Returns true if the test ran was succesfully and false otherwise.
-    ss::future<bool> self_configure_test(
-      const bucket_name& bucket, bool remote_read, bool remote_write);
+    // Performs testing as part of the self-configuration step. Returns true if
+    // the test was successful (indicating that the current addressing style is
+    // compatible with the configured cloud storage provider), and false
+    // otherwise.
+    ss::future<bool> self_configure_test(const bucket_name& bucket);
 
 private:
     request_creator _requestor;

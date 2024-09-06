@@ -617,6 +617,7 @@ struct instance_generator<cluster::topic_properties> {
           tests::random_optional([] { return tests::random_bool(); }),
           tests::random_optional(
             [] { return tests::random_named_string<ss::sstring>(); }),
+          model::random_topic_namespace(),
           instance_generator<cluster::remote_topic_properties>::random(),
           tests::random_optional(
             [] { return random_generators::get_int<uint32_t>(1024 * 1024); }),
@@ -661,6 +662,7 @@ struct instance_generator<cluster::topic_configuration> {
         tc.tp_ns = model::random_topic_namespace();
         tc.partition_count = random_generators::get_int<int32_t>();
         tc.replication_factor = random_generators::get_int<int16_t>();
+        tc.is_migrated = tests::random_bool();
         tc.properties = instance_generator<cluster::topic_properties>::random();
         return tc;
     }
@@ -670,11 +672,13 @@ struct instance_generator<cluster::topic_configuration> {
           {model::ns(""),
            model::topic(""),
            std::numeric_limits<int32_t>::max(),
-           std::numeric_limits<int16_t>::max()},
+           std::numeric_limits<int16_t>::max(),
+           std::numeric_limits<bool>::max()},
           {model::ns(""),
            model::topic(""),
            std::numeric_limits<int32_t>::min(),
-           std::numeric_limits<int16_t>::min()}};
+           std::numeric_limits<int16_t>::min(),
+           std::numeric_limits<bool>::min()}};
     }
 };
 

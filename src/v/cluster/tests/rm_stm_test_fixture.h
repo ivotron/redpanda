@@ -24,7 +24,7 @@ struct rm_stm_test_fixture : simple_raft_fixture {
         producer_state_manager
           .start(
             config::mock_binding(std::numeric_limits<uint64_t>::max()),
-            std::chrono::milliseconds::max(),
+            config::mock_binding(std::chrono::milliseconds::max()),
             config::mock_binding(std::numeric_limits<uint64_t>::max()))
           .get();
         producer_state_manager
@@ -59,7 +59,7 @@ struct rm_stm_test_fixture : simple_raft_fixture {
     }
 
     auto local_snapshot(uint8_t version) {
-        return _stm->do_take_local_snapshot(version);
+        return _stm->do_take_local_snapshot(version, {});
     }
 
     auto apply_snapshot(raft::stm_snapshot_header hdr, iobuf buf) {

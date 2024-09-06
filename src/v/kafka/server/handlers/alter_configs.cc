@@ -20,7 +20,6 @@
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
@@ -43,6 +42,7 @@ static void parse_and_set_shadow_indexing_mode(
     property_update,
   const std::optional<ss::sstring>& value,
   model::shadow_indexing_mode enabled_value) {
+    property_update.op = cluster::incremental_update_operation::set;
     if (!value) {
         property_update.value = model::shadow_indexing_mode::disabled;
     }
@@ -56,8 +56,9 @@ static void parse_and_set_shadow_indexing_mode(
 }
 
 checked<cluster::topic_properties_update, alter_configs_resource_response>
-create_topic_properties_update(
-  const request_context& ctx, alter_configs_resource& resource) {
+create_topic_properties_update(alter_configs_resource& resource) {
+    using op_t = cluster::incremental_update_operation;
+
     model::topic_namespace tp_ns(
       model::kafka_namespace, model::topic(resource.resource_name));
     cluster::topic_properties_update update(tp_ns);
@@ -69,50 +70,34 @@ create_topic_properties_update(
      * configuration in topic table, the only difference is the replication
      * factor, if not set in the request explicitly it will not be overriden.
      */
-    update.properties.compaction_strategy.op
-      = cluster::incremental_update_operation::set;
-    update.properties.compression.op
-      = cluster::incremental_update_operation::set;
-    update.properties.segment_size.op
-      = cluster::incremental_update_operation::set;
-    update.properties.timestamp_type.op
-      = cluster::incremental_update_operation::set;
-    update.properties.retention_bytes.op
-      = cluster::incremental_update_operation::set;
-    update.properties.retention_duration.op
-      = cluster::incremental_update_operation::set;
-    update.properties.shadow_indexing.op
-      = cluster::incremental_update_operation::set;
-    update.custom_properties.replication_factor.op
-      = cluster::incremental_update_operation::none;
-    update.custom_properties.data_policy.op
-      = cluster::incremental_update_operation::none;
+    constexpr auto apply_op = [](op_t op) {
+        return [op](auto&&... prop) { ((prop.op = op), ...); };
+    };
+    std::apply(apply_op(op_t::remove), update.properties.serde_fields());
+    std::apply(apply_op(op_t::none), update.custom_properties.serde_fields());
+
+    static_assert(
+      std::tuple_size_v<decltype(update.properties.serde_fields())> == 26,
+      "If you added a property, please decide on it's default alter config "
+      "policy, and handle the update in the loop below");
+    static_assert(
+      std::tuple_size_v<decltype(update.custom_properties.serde_fields())> == 2,
+      "If you added a property, please decide on it's default alter config "
+      "policy, and handle the update in the loop below");
 
     /**
-     * Since 'cleanup.policy' is always defaulted to 'delete' at topic creation,
-     * we must special case the handling to preserve this default.
+     * The shadow_indexing properties ('redpanda.remote.(read|write|delete)')
+     * are special "sticky" topic properties that are always set as a
+     * topic-level override. We should prevent changing them unless explicitly
+     * requested.
+     *
+     * See: https://github.com/redpanda-data/redpanda/issues/7451
      */
-    update.properties.cleanup_policy_bitflags.op
-      = cluster::incremental_update_operation::set;
-    update.properties.cleanup_policy_bitflags.value
-      = ctx.metadata_cache().get_default_cleanup_policy_bitflags();
+    update.properties.shadow_indexing.op = op_t::none;
+    update.properties.remote_delete.op = op_t::none;
 
-    update.properties.record_key_schema_id_validation.op
-      = cluster::incremental_update_operation::set;
-    update.properties.record_key_schema_id_validation_compat.op
-      = cluster::incremental_update_operation::set;
-    update.properties.record_key_subject_name_strategy.op
-      = cluster::incremental_update_operation::set;
-    update.properties.record_key_subject_name_strategy_compat.op
-      = cluster::incremental_update_operation::set;
-    update.properties.record_value_schema_id_validation.op
-      = cluster::incremental_update_operation::set;
-    update.properties.record_value_schema_id_validation_compat.op
-      = cluster::incremental_update_operation::set;
-    update.properties.record_value_subject_name_strategy.op
-      = cluster::incremental_update_operation::set;
-    update.properties.record_value_subject_name_strategy_compat.op
-      = cluster::incremental_update_operation::set;
+    // Now that the defaults are set, continue to set properties from the
+    // request
 
     schema_id_validation_config_parser schema_id_validation_config_parser{
       update.properties};
@@ -324,11 +309,8 @@ alter_topic_configuration(
     return do_alter_topics_configuration<
       alter_configs_resource,
       alter_configs_resource_response>(
-      ctx,
-      std::move(resources),
-      validate_only,
-      [&ctx](alter_configs_resource& r) {
-          return create_topic_properties_update(ctx, r);
+      ctx, std::move(resources), validate_only, [](alter_configs_resource& r) {
+          return create_topic_properties_update(r);
       });
 }
 

@@ -11,6 +11,8 @@
 
 #include "pandaproxy/schema_registry/json.h"
 
+#include "json/chunked_buffer.h"
+#include "json/chunked_input_stream.h"
 #include "json/document.h"
 #include "json/ostreamwrapper.h"
 #include "json/schema.h"
@@ -31,12 +33,19 @@
 
 #include <absl/container/flat_hash_set.h>
 #include <absl/container/inlined_vector.h>
-#include <boost/math/special_functions/relative_difference.hpp>
+#include <boost/graph/adjacency_list.hpp>
+#include <boost/graph/max_cardinality_matching.hpp>
+#include <boost/math/special_functions/ulp.hpp>
 #include <boost/outcome/std_result.hpp>
 #include <boost/outcome/success_failure.hpp>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <jsoncons/basic_json.hpp>
+#include <jsoncons/json.hpp>
+#include <jsoncons_ext/jsonschema/evaluation_options.hpp>
+#include <jsoncons_ext/jsonschema/json_schema_factory.hpp>
+#include <jsoncons_ext/jsonschema/jsonschema.hpp>
 #include <rapidjson/error/en.h>
 #include <re2/re2.h>
 
@@ -46,20 +55,80 @@
 
 namespace pandaproxy::schema_registry {
 
-struct json_schema_definition::impl {
-    ss::sstring to_json() const {
-        json::StringBuffer buf;
-        json::Writer<json::StringBuffer> wrt(buf);
-        doc.Accept(wrt);
-        return {buf.GetString(), buf.GetLength()};
+namespace {
+
+// this is the list of supported dialects
+enum class json_schema_dialect {
+    draft4,
+    draft6,
+    draft7,
+    draft201909,
+    draft202012,
+};
+
+constexpr std::string_view
+to_uri(json_schema_dialect draft, bool strip = false) {
+    using enum json_schema_dialect;
+    auto dialect_str = [&]() -> std::string_view {
+        switch (draft) {
+        case draft4:
+            return "http://json-schema.org/draft-04/schema#";
+        case draft6:
+            return "http://json-schema.org/draft-06/schema#";
+        case draft7:
+            return "http://json-schema.org/draft-07/schema#";
+        case draft201909:
+            return "https://json-schema.org/draft/2019-09/schema#";
+        case draft202012:
+            return "https://json-schema.org/draft/2020-12/schema#";
+        }
+    }();
+
+    if (strip) {
+        // strip final # from uri
+        dialect_str.remove_suffix(1);
     }
 
-    explicit impl(json::Document doc, std::string_view name)
-      : doc{std::move(doc)}
-      , name{name} {}
+    return dialect_str;
+}
 
+constexpr std::optional<json_schema_dialect> from_uri(std::string_view uri) {
+    using enum json_schema_dialect;
+    return string_switch<std::optional<json_schema_dialect>>{uri}
+      .match_all(to_uri(draft4), to_uri(draft4, true), draft4)
+      .match_all(to_uri(draft6), to_uri(draft6, true), draft6)
+      .match_all(to_uri(draft7), to_uri(draft7, true), draft7)
+      .match_all(to_uri(draft201909), to_uri(draft201909, true), draft201909)
+      .match_all(to_uri(draft202012), to_uri(draft202012, true), draft202012)
+      .default_match(std::nullopt);
+}
+
+struct document_context {
     json::Document doc;
+    json_schema_dialect dialect;
+};
+
+} // namespace
+
+struct json_schema_definition::impl {
+    iobuf to_json() const {
+        json::chunked_buffer buf;
+        json::Writer<json::chunked_buffer> wrt(buf);
+        ctx.doc.Accept(wrt);
+        return std::move(buf).as_iobuf();
+    }
+
+    impl(
+      document_context ctx,
+      std::string_view name,
+      canonical_schema_definition::references refs)
+      : ctx{std::move(ctx)}
+      , name{name}
+      , refs(std::move(refs)) {}
+
+    document_context ctx;
     ss::sstring name;
+    canonical_schema_definition::references refs;
 };
 
 bool operator==(
@@ -80,565 +149,29 @@ canonical_schema_definition::raw_string json_schema_definition::raw() const {
     return canonical_schema_definition::raw_string{_impl->to_json()};
 }
 
+canonical_schema_definition::references const&
+json_schema_definition::refs() const {
+    return _impl->refs;
+}
+
 ss::sstring json_schema_definition::name() const { return {_impl->name}; };
 
+std::optional<ss::sstring> json_schema_definition::title() const {
+    if (!_impl->ctx.doc.IsObject()) {
+        return std::nullopt;
+    }
+    auto it = _impl->ctx.doc.FindMember("title");
+    if (it == _impl->ctx.doc.MemberEnd()) {
+        return std::nullopt;
+    }
+
+    return ss::sstring{it->value.GetString(), it->value.GetStringLength()};
+}
 namespace {
 
-// from https://json-schema.org/draft-04/schema, this is used to meta-validate a
-// jsonschema.
-// note: draft5 uses the same metaschema as draft4
-constexpr std::string_view json_draft_4_metaschema = R"json(
-{
-    "id": "http://json-schema.org/draft-04/schema#",
-    "$schema": "http://json-schema.org/draft-04/schema#",
-    "description": "Core schema meta-schema",
-    "definitions": {
-        "schemaArray": {
-            "type": "array",
-            "minItems": 1,
-            "items": { "$ref": "#" }
-        },
-        "positiveInteger": {
-            "type": "integer",
-            "minimum": 0
-        },
-        "positiveIntegerDefault0": {
-            "allOf": [ { "$ref": "#/definitions/positiveInteger" }, { "default": 0 } ]
-        },
-        "simpleTypes": {
-            "enum": [ "array", "boolean", "integer", "null", "number", "object", "string" ]
-        },
-        "stringArray": {
-            "type": "array",
-            "items": { "type": "string" },
-            "minItems": 1,
-            "uniqueItems": true
-        }
-    },
-    "type": "object",
-    "properties": {
-        "id": {
-            "type": "string"
-        },
-        "$schema": {
-            "type": "string"
-        },
-        "title": {
-            "type": "string"
-        },
-        "description": {
-            "type": "string"
-        },
-        "default": {},
-        "multipleOf": {
-            "type": "number",
-            "minimum": 0,
-            "exclusiveMinimum": true
-        },
-        "maximum": {
-            "type": "number"
-        },
-        "exclusiveMaximum": {
-            "type": "boolean",
-            "default": false
-        },
-        "minimum": {
-            "type": "number"
-        },
-        "exclusiveMinimum": {
-            "type": "boolean",
-            "default": false
-        },
-        "maxLength": { "$ref": "#/definitions/positiveInteger" },
-        "minLength": { "$ref": "#/definitions/positiveIntegerDefault0" },
-        "pattern": {
-            "type": "string",
-            "format": "regex"
-        },
-        "additionalItems": {
-            "anyOf": [
-                { "type": "boolean" },
-                { "$ref": "#" }
-            ],
-            "default": {}
-        },
-        "items": {
-            "anyOf": [
-                { "$ref": "#" },
-                { "$ref": "#/definitions/schemaArray" }
-            ],
-            "default": {}
-        },
-        "maxItems": { "$ref": "#/definitions/positiveInteger" },
-        "minItems": { "$ref": "#/definitions/positiveIntegerDefault0" },
-        "uniqueItems": {
-            "type": "boolean",
-            "default": false
-        },
-        "maxProperties": { "$ref": "#/definitions/positiveInteger" },
-        "minProperties": { "$ref": "#/definitions/positiveIntegerDefault0" },
-        "required": { "$ref": "#/definitions/stringArray" },
-        "additionalProperties": {
-            "anyOf": [
-                { "type": "boolean" },
-                { "$ref": "#" }
-            ],
-            "default": {}
-        },
-        "definitions": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "default": {}
-        },
-        "properties": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "default": {}
-        },
-        "patternProperties": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "default": {}
-        },
-        "dependencies": {
-            "type": "object",
-            "additionalProperties": {
-                "anyOf": [
-                    { "$ref": "#" },
-                    { "$ref": "#/definitions/stringArray" }
-                ]
-            }
-        },
-        "enum": {
-            "type": "array",
-            "minItems": 1,
-            "uniqueItems": true
-        },
-        "type": {
-            "anyOf": [
-                { "$ref": "#/definitions/simpleTypes" },
-                {
-                    "type": "array",
-                    "items": { "$ref": "#/definitions/simpleTypes" },
-                    "minItems": 1,
-                    "uniqueItems": true
-                }
-            ]
-        },
-        "format": { "type": "string" },
-        "allOf": { "$ref": "#/definitions/schemaArray" },
-        "anyOf": { "$ref": "#/definitions/schemaArray" },
-        "oneOf": { "$ref": "#/definitions/schemaArray" },
-        "not": { "$ref": "#" }
-    },
-    "dependencies": {
-        "exclusiveMaximum": [ "maximum" ],
-        "exclusiveMinimum": [ "minimum" ]
-    },
-    "default": {}
+std::string_view as_string_view(json::Value const& v) {
+    return {v.GetString(), v.GetStringLength()};
 }
-)json";
-
-/*
- From https://json-schema.org/draft-06/schema, this is the draft6 metaschema
- used to validate draft6 json schemas.
- TODO It's implemented in the draft4 dialect, because the current version
- of rapidjson only support draft4, change this when it's upgraded
- For reference, this is the diff applied to the original metaschema:
---- draft6.json	2024-07-03 10:46:11.956695951 +0200
-+++ draft6.asdraft4.json	2024-07-05 15:55:10.472362720 +0200
-@@ -1,4 +1,4 @@
- {
--    "$schema": "http://json-schema.org/draft-06/schema#",
--    "$id": "http://json-schema.org/draft-06/schema#",
-+    "$schema": "http://json-schema.org/draft-04/schema#",
-+    "id": "http://json-schema.org/draft-06/schema#",
-     "title": "Core schema meta-schema",
-@@ -65,3 +66,4 @@
-             "type": "number",
--            "exclusiveMinimum": 0
-+            "minimum": 0,
-+            "exclusiveMinimum": true
-         },
-*/
-constexpr std::string_view json_draft_6_metaschema = R"json(
-{
-    "$schema": "http://json-schema.org/draft-04/schema#",
-    "id": "http://json-schema.org/draft-06/schema#",
-    "title": "Core schema meta-schema",
-    "definitions": {
-        "schemaArray": {
-            "type": "array",
-            "minItems": 1,
-            "items": { "$ref": "#" }
-        },
-        "nonNegativeInteger": {
-            "type": "integer",
-            "minimum": 0
-        },
-        "nonNegativeIntegerDefault0": {
-            "allOf": [
-                { "$ref": "#/definitions/nonNegativeInteger" },
-                { "default": 0 }
-            ]
-        },
-        "simpleTypes": {
-            "enum": [
-                "array",
-                "boolean",
-                "integer",
-                "null",
-                "number",
-                "object",
-                "string"
-            ]
-        },
-        "stringArray": {
-            "type": "array",
-            "items": { "type": "string" },
-            "uniqueItems": true,
-            "default": []
-        }
-    },
-    "type": ["object", "boolean"],
-    "properties": {
-        "$id": {
-            "type": "string",
-            "format": "uri-reference"
-        },
-        "$schema": {
-            "type": "string",
-            "format": "uri"
-        },
-        "$ref": {
-            "type": "string",
-            "format": "uri-reference"
-        },
-        "title": {
-            "type": "string"
-        },
-        "description": {
-            "type": "string"
-        },
-        "default": {},
-        "examples": {
-            "type": "array",
-            "items": {}
-        },
-        "multipleOf": {
-            "type": "number",
-            "minimum": 0,
-            "exclusiveMinimum": true
-        },
-        "maximum": {
-            "type": "number"
-        },
-        "exclusiveMaximum": {
-            "type": "number"
-        },
-        "minimum": {
-            "type": "number"
-        },
-        "exclusiveMinimum": {
-            "type": "number"
-        },
-        "maxLength": { "$ref": "#/definitions/nonNegativeInteger" },
-        "minLength": { "$ref": "#/definitions/nonNegativeIntegerDefault0" },
-        "pattern": {
-            "type": "string",
-            "format": "regex"
-        },
-        "additionalItems": { "$ref": "#" },
-        "items": {
-            "anyOf": [
-                { "$ref": "#" },
-                { "$ref": "#/definitions/schemaArray" }
-            ],
-            "default": {}
-        },
-        "maxItems": { "$ref": "#/definitions/nonNegativeInteger" },
-        "minItems": { "$ref": "#/definitions/nonNegativeIntegerDefault0" },
-        "uniqueItems": {
-            "type": "boolean",
-            "default": false
-        },
-        "contains": { "$ref": "#" },
-        "maxProperties": { "$ref": "#/definitions/nonNegativeInteger" },
-        "minProperties": { "$ref": "#/definitions/nonNegativeIntegerDefault0" },
-        "required": { "$ref": "#/definitions/stringArray" },
-        "additionalProperties": { "$ref": "#" },
-        "definitions": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "default": {}
-        },
-        "properties": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "default": {}
-        },
-        "patternProperties": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "propertyNames": { "format": "regex" },
-            "default": {}
-        },
-        "dependencies": {
-            "type": "object",
-            "additionalProperties": {
-                "anyOf": [
-                    { "$ref": "#" },
-                    { "$ref": "#/definitions/stringArray" }
-                ]
-            }
-        },
-        "propertyNames": { "$ref": "#" },
-        "const": {},
-        "enum": {
-            "type": "array",
-            "minItems": 1,
-            "uniqueItems": true
-        },
-        "type": {
-            "anyOf": [
-                { "$ref": "#/definitions/simpleTypes" },
-                {
-                    "type": "array",
-                    "items": { "$ref": "#/definitions/simpleTypes" },
-                    "minItems": 1,
-                    "uniqueItems": true
-                }
-            ]
-        },
-        "format": { "type": "string" },
-        "allOf": { "$ref": "#/definitions/schemaArray" },
-        "anyOf": { "$ref": "#/definitions/schemaArray" },
-        "oneOf": { "$ref": "#/definitions/schemaArray" },
-        "not": { "$ref": "#" }
-    },
-    "default": {}
-}
-)json";
-
-/*
- From https://json-schema.org/draft-07/schema, this is the draft7 metaschema
- used to validate draft7 json schemas.
- TODO It's implemented in the draft4 dialect, because the current version
- of rapidjson only support draft4, change this when it's upgraded
- For reference, this is the diff applied to the original metaschema:
---- draft7.json	2024-07-02 09:53:23.943963373 +0200
-+++ draft7.asdraft4.json	2024-07-05 15:55:21.160409278 +0200
-@@ -1,4 +1,4 @@
- {
--    "$schema": "http://json-schema.org/draft-07/schema#",
--    "$id": "http://json-schema.org/draft-07/schema#",
-+    "$schema": "http://json-schema.org/draft-04/schema#",
-+    "id": "http://json-schema.org/draft-07/schema#",
-     "title": "Core schema meta-schema",
-@@ -61,3 +62,3 @@
-         },
--        "default": true,
-+        "default": {},
-         "readOnly": {
-@@ -72,3 +73,3 @@
-             "type": "array",
--            "items": true
-+            "items": {}
-         },
-@@ -76,3 +77,4 @@
-             "type": "number",
--            "exclusiveMinimum": 0
-+            "minimum": 0,
-+            "exclusiveMinimum": true
-         },
-@@ -141,6 +143,6 @@
-         "propertyNames": { "$ref": "#" },
--        "const": true,
-+        "const": {},
-         "enum": {
-             "type": "array",
--            "items": true,
-+            "items": {},
-             "minItems": 1,
-*/
-
-constexpr std::string_view json_draft_7_metaschema = R"json(
-{
-    "$schema": "http://json-schema.org/draft-04/schema#",
-    "id": "http://json-schema.org/draft-07/schema#",
-    "title": "Core schema meta-schema",
-    "definitions": {
-        "schemaArray": {
-            "type": "array",
-            "minItems": 1,
-            "items": { "$ref": "#" }
-        },
-        "nonNegativeInteger": {
-            "type": "integer",
-            "minimum": 0
-        },
-        "nonNegativeIntegerDefault0": {
-            "allOf": [
-                { "$ref": "#/definitions/nonNegativeInteger" },
-                { "default": 0 }
-            ]
-        },
-        "simpleTypes": {
-            "enum": [
-                "array",
-                "boolean",
-                "integer",
-                "null",
-                "number",
-                "object",
-                "string"
-            ]
-        },
-        "stringArray": {
-            "type": "array",
-            "items": { "type": "string" },
-            "uniqueItems": true,
-            "default": []
-        }
-    },
-    "type": ["object", "boolean"],
-    "properties": {
-        "$id": {
-            "type": "string",
-            "format": "uri-reference"
-        },
-        "$schema": {
-            "type": "string",
-            "format": "uri"
-        },
-        "$ref": {
-            "type": "string",
-            "format": "uri-reference"
-        },
-        "$comment": {
-            "type": "string"
-        },
-        "title": {
-            "type": "string"
-        },
-        "description": {
-            "type": "string"
-        },
-        "default": {},
-        "readOnly": {
-            "type": "boolean",
-            "default": false
-        },
-        "writeOnly": {
-            "type": "boolean",
-            "default": false
-        },
-        "examples": {
-            "type": "array",
-            "items": {}
-        },
-        "multipleOf": {
-            "type": "number",
-            "minimum": 0,
-            "exclusiveMinimum": true
-        },
-        "maximum": {
-            "type": "number"
-        },
-        "exclusiveMaximum": {
-            "type": "number"
-        },
-        "minimum": {
-            "type": "number"
-        },
-        "exclusiveMinimum": {
-            "type": "number"
-        },
-        "maxLength": { "$ref": "#/definitions/nonNegativeInteger" },
-        "minLength": { "$ref": "#/definitions/nonNegativeIntegerDefault0" },
-        "pattern": {
-            "type": "string",
-            "format": "regex"
-        },
-        "additionalItems": { "$ref": "#" },
-        "items": {
-            "anyOf": [
-                { "$ref": "#" },
-                { "$ref": "#/definitions/schemaArray" }
-            ],
-            "default": true
-        },
-        "maxItems": { "$ref": "#/definitions/nonNegativeInteger" },
-        "minItems": { "$ref": "#/definitions/nonNegativeIntegerDefault0" },
-        "uniqueItems": {
-            "type": "boolean",
-            "default": false
-        },
-        "contains": { "$ref": "#" },
-        "maxProperties": { "$ref": "#/definitions/nonNegativeInteger" },
-        "minProperties": { "$ref": "#/definitions/nonNegativeIntegerDefault0" },
-        "required": { "$ref": "#/definitions/stringArray" },
-        "additionalProperties": { "$ref": "#" },
-        "definitions": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "default": {}
-        },
-        "properties": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "default": {}
-        },
-        "patternProperties": {
-            "type": "object",
-            "additionalProperties": { "$ref": "#" },
-            "propertyNames": { "format": "regex" },
-            "default": {}
-        },
-        "dependencies": {
-            "type": "object",
-            "additionalProperties": {
-                "anyOf": [
-                    { "$ref": "#" },
-                    { "$ref": "#/definitions/stringArray" }
-                ]
-            }
-        },
-        "propertyNames": { "$ref": "#" },
-        "const": {},
-        "enum": {
-            "type": "array",
-            "items": {},
-            "minItems": 1,
-            "uniqueItems": true
-        },
-        "type": {
-            "anyOf": [
-                { "$ref": "#/definitions/simpleTypes" },
-                {
-                    "type": "array",
-                    "items": { "$ref": "#/definitions/simpleTypes" },
-                    "minItems": 1,
-                    "uniqueItems": true
-                }
-            ]
-        },
-        "format": { "type": "string" },
-        "contentMediaType": { "type": "string" },
-        "contentEncoding": { "type": "string" },
-        "if": { "$ref": "#" },
-        "then": { "$ref": "#" },
-        "else": { "$ref": "#" },
-        "allOf": { "$ref": "#/definitions/schemaArray" },
-        "anyOf": { "$ref": "#/definitions/schemaArray" },
-        "oneOf": { "$ref": "#/definitions/schemaArray" },
-        "not": { "$ref": "#" }
-    },
-    "default": true
-}
-)json";
-
-result<json::Document> parse_json(std::string_view v);
 
 ss::future<> check_references(sharded_store& store, canonical_schema schema) {
     for (const auto& ref : schema.def().refs()) {
@@ -653,48 +186,6 @@ ss::future<> check_references(sharded_store& store, canonical_schema schema) {
     }
 }
 
-// this is the list of supported dialects
-enum class json_schema_dialect {
-    draft4,
-    draft5,
-    draft6,
-    draft7,
-};
-
-constexpr std::string_view
-to_uri(json_schema_dialect draft, bool strip = false) {
-    using enum json_schema_dialect;
-    auto dialect_str = [&]() -> std::string_view {
-        switch (draft) {
-        case draft4:
-            return "http://json-schema.org/draft-04/schema#";
-        case draft5:
-            return "http://json-schema.org/draft-05/schema#";
-        case draft6:
-            return "http://json-schema.org/draft-06/schema#";
-        case draft7:
-            return "http://json-schema.org/draft-07/schema#";
-        }
-    }();
-
-    if (strip) {
-        // strip final # from uri
-        dialect_str.remove_suffix(1);
-    }
-
-    return dialect_str;
-}
-
-constexpr std::optional<json_schema_dialect> from_uri(std::string_view uri) {
-    using enum json_schema_dialect;
-    return string_switch<std::optional<json_schema_dialect>>{uri}
-      .match_all(to_uri(draft4), to_uri(draft4, true), draft4)
-      .match_all(to_uri(draft5), to_uri(draft5, true), draft5)
-      .match_all(to_uri(draft6), to_uri(draft6, true), draft6)
-      .match_all(to_uri(draft7), to_uri(draft7, true), draft7)
-      .default_match(std::nullopt);
-}
-
 // helper struct to format json::Value
 struct pj {
     json::Value const& v;
@@ -706,99 +197,101 @@ struct pj {
     }
 };
 
+class schema_context {
+public:
+    explicit schema_context(json_schema_definition::impl const& schema)
+      : _schema{schema} {}
+
+    json_schema_dialect dialect() const { return _schema.ctx.dialect; }
+
+private:
+    json_schema_definition::impl const& _schema;
+};
+
+struct context {
+    schema_context older;
+    schema_context newer;
+};
+
 template<json_schema_dialect Dialect>
-json::SchemaDocument const& get_metaschema() {
+jsoncons::jsonschema::json_schema<jsoncons::json> const& get_metaschema() {
     static auto const meteschema_doc = [] {
-        auto metaschema_str = [] {
+        auto metaschema = [] {
             switch (Dialect) {
             case json_schema_dialect::draft4:
-                return json_draft_4_metaschema;
-            case json_schema_dialect::draft5:
-                // note1: draft5 uses the same metaschema as draft4.
-                // note2: this case is handled for completeness but
-                // get_metaschema<draft5>() should not be instantiated because
-                // the codegen would be redundant
-                return json_draft_4_metaschema;
+                return jsoncons::jsonschema::draft4::schema_draft4<
+                  jsoncons::json>::get_schema();
             case json_schema_dialect::draft6:
-                return json_draft_6_metaschema;
+                return jsoncons::jsonschema::draft6::schema_draft6<
+                  jsoncons::json>::get_schema();
             case json_schema_dialect::draft7:
-                return json_draft_7_metaschema;
+                return jsoncons::jsonschema::draft7::schema_draft7<
+                  jsoncons::json>::get_schema();
+            case json_schema_dialect::draft201909:
+                return jsoncons::jsonschema::draft201909::schema_draft201909<
+                  jsoncons::json>::get_schema();
+            case json_schema_dialect::draft202012:
+                return jsoncons::jsonschema::draft202012::schema_draft202012<
+                  jsoncons::json>::get_schema();
             }
         }();
 
-        auto metaschema_json = json::Document{};
-        metaschema_json.Parse(metaschema_str.data(), metaschema_str.size());
-        vassert(
-          !metaschema_json.HasParseError(), "Malformed metaschema document");
-
-        return json::SchemaDocument{metaschema_json};
+        // Throws if the metaschema can't be parsed (which should never happen
+        // and if it does, it would be detected by unit tests)
+        return jsoncons::jsonschema::make_json_schema(metaschema);
     }();
 
     return meteschema_doc;
 }
 
-result<void> validate_json_schema(
-  json_schema_dialect dialect, json::Document const& schema) {
+result<json_schema_dialect> validate_json_schema(
+  json_schema_dialect dialect, const jsoncons::json& schema) {
     // validation pre-step: get metaschema for json draft
-    auto const& metaschema_doc = [=]() -> json::SchemaDocument const& {
+    auto const& metaschema_doc = [=]() -> const auto& {
         using enum json_schema_dialect;
         switch (dialect) {
         case draft4:
-            return get_metaschema<draft4>();
-        case draft5:
-            // NOTE: draft5 reuses the metaschema for draft4, so there is no
-            // need to instantiate get_metaschema<draft5>
             return get_metaschema<draft4>();
         case draft6:
             return get_metaschema<draft6>();
         case draft7:
             return get_metaschema<draft7>();
+        case draft201909:
+            return get_metaschema<draft201909>();
+        case draft202012:
+            return get_metaschema<draft202012>();
         }
     }();
 
     // validation of schema: validate it against metaschema
-    auto validator = json::SchemaValidator{metaschema_doc};
-
-    if (!schema.Accept(validator)) {
-        // schema it's not a valid json schema for Dialect, according to
-        // metaschema
-
-        auto error_loc_metaschema = json::StringBuffer{};
-        auto error_loc_schema = json::StringBuffer{};
-        validator.GetInvalidSchemaPointer().StringifyUriFragment(
-          error_loc_metaschema);
-        validator.GetInvalidDocumentPointer().StringifyUriFragment(
-          error_loc_schema);
-        auto invalid_keyword = validator.GetInvalidSchemaKeyword();
-
+    try {
+        // Throws when the schema is invalid with details about the failure
+        metaschema_doc.validate(schema);
+    } catch (const std::exception& e) {
         return error_info{
           error_code::schema_invalid,
           fmt::format(
-            "Invalid json schema: '{}', invalid metaschema: '{}', invalid "
-            "keyword: '{}'",
-            std::string_view{
-              error_loc_schema.GetString(), error_loc_schema.GetLength()},
-            std::string_view{
-              error_loc_metaschema.GetString(),
-              error_loc_metaschema.GetLength()},
-            invalid_keyword)};
+            "Invalid json schema: '{}'. Error: '{}'",
+            schema.to_string(),
+            e.what())};
     }
 
     // schema is a syntactically valid json schema, where $schema == Dialect.
     // TODO AB cross validate "$ref" fields, this is not done automatically
     // TODO validate that "pattern" and "patternProperties" are valid regex
-    return outcome::success();
+    return dialect;
 }
 
-result<void> try_validate_json_schema(json::Document const& schema) {
+result<json_schema_dialect>
+try_validate_json_schema(const jsoncons::json& schema) {
     using enum json_schema_dialect;
 
     // no explicit $schema: try to validate from newest to oldest draft
     auto first_error = std::optional<error_info>{};
-    for (auto d : {draft7, draft6, draft4}) {
+    for (auto d : {draft202012, draft201909, draft7, draft6, draft4}) {
         auto res = validate_json_schema(d, schema);
         if (res.has_value()) {
-            return outcome::success();
+            return res;
         }
         // failed to validated with dialect d. save error for reporting
         if (!first_error.has_value()) {
@@ -813,9 +306,10 @@ result<void> try_validate_json_schema(json::Document const& schema) {
     return first_error.value();
 }
 
-result<json::Document> parse_json(std::string_view v) {
+result<document_context> parse_json(iobuf buf) {
     // parse string in json document, check it's a valid json
-    auto schema_stream = rapidjson::MemoryStream{v.data(), v.size()};
+    auto schema_stream = json::chunked_input_stream{
+      buf.share(0, buf.size_bytes())};
     auto schema = json::Document{};
     if (schema.ParseStream(schema_stream).HasParseError()) {
         // not a valid json document, return error
@@ -831,28 +325,39 @@ result<json::Document> parse_json(std::string_view v) {
     // metaschema
     auto dialect = std::optional<json_schema_dialect>{};
 
-    if (auto it = schema.FindMember("$schema"); it != schema.MemberEnd()) {
-        if (it->value.IsString()) {
-            dialect = from_uri(it->value.GetString());
-        }
+    if (schema.IsObject()) {
+        // "true/false" are valid schemas so here we need to check that the
+        // schema is an actual object
+        if (auto it = schema.FindMember("$schema"); it != schema.MemberEnd()) {
+            if (it->value.IsString()) {
+                dialect = from_uri(as_string_view(it->value));
+            }
 
-        if (it->value.IsString() == false || dialect == std::nullopt) {
-            // if present, "$schema" have to be a string, and it has to be one
-            // the implemented dialects. If not, return an error
-            return error_info{
-              error_code::schema_invalid,
-              fmt::format(
-                "Unsupported json schema dialect: '{}'", pj{it->value})};
+            if (it->value.IsString() == false || dialect == std::nullopt) {
+                // if present, "$schema" have to be a string, and it has to be
+                // one the implemented dialects. If not, return an error
+                return error_info{
+                  error_code::schema_invalid,
+                  fmt::format(
+                    "Unsupported json schema dialect: '{}'", pj{it->value})};
+            }
         }
     }
 
+    // We use jsoncons for validating the schema against the metaschema as
+    // currently rapidjson doesn't support validating schemas newer than
+    // draft 5.
+    iobuf_istream is{std::move(buf)};
+    auto jsoncons_schema = jsoncons::json::parse(is.istream());
     auto validation_res = dialect.has_value()
-                            ? validate_json_schema(dialect.value(), schema)
-                            : try_validate_json_schema(schema);
+                            ? validate_json_schema(
+                              dialect.value(), jsoncons_schema)
+                            : try_validate_json_schema(jsoncons_schema);
     if (validation_res.has_error()) {
         return validation_res.as_failure();
     }
-    return {std::move(schema)};
+
+    return {std::move(schema), validation_res.assume_value()};
 }
 
 /// is_superset section
@@ -860,7 +365,8 @@ result<json::Document> parse_json(std::string_view v) {
 // a schema O is a superset of another schema N if every schema that is valid
 // for N is also valid for O. precondition: older and newer are both valid
 // schemas
-bool is_superset(json::Value const& older, json::Value const& newer);
+bool is_superset(
+  context const& ctx, json::Value const& older, json::Value const& newer);
 
 // close the implementation in a namespace to keep it contained
 namespace is_superset_impl {
@@ -909,7 +415,7 @@ constexpr std::optional<json_type> from_string_view(std::string_view v) {
 }
 
 constexpr auto parse_json_type(json::Value const& v) {
-    std::string_view sv{v.GetString(), v.GetStringLength()};
+    auto sv = as_string_view(v);
     auto type = from_string_view(sv);
     if (!type) {
         throw as_exception(error_info{
@@ -919,14 +425,14 @@ constexpr auto parse_json_type(json::Value const& v) {
     return *type;
 }
 
-json::Value const& get_true_schema() {
+json::Value::ConstObject get_true_schema() {
     // A `true` schema is one that validates every possible input, it's literal
     // json value is `{}` Then `"additionalProperty": true` is equivalent to
     // `"additionalProperties": {}` it's used during mainly in
     // is_object_superset(older, newer) and in is_superset to short circuit
     // validation
-    static auto true_schema = json::Value{rapidjson::kObjectType};
-    return true_schema;
+    static auto const true_schema = json::Value{rapidjson::kObjectType};
+    return true_schema.GetObject();
 }
 
 bool is_true_schema(json::Value const& v) {
@@ -949,19 +455,19 @@ bool is_true_schema(json::Value const& v) {
     return false;
 }
 
-json::Value const& get_false_schema() {
+json::Value::ConstObject get_false_schema() {
     // A `false` schema is one that doesn't validate any input, it's literal
     // json value is `{"not": {}}`
     // `"additionalProperty": false` is equivalent to `"additionalProperties":
     // {"not": {}}` it's used during mainly in is_object_superset(older, newer)
     // and in is_superset to short circuit validation
-    static auto false_schema = [] {
+    static auto const false_schema = [] {
         auto tmp = json::Document{};
         tmp.Parse(R"({"not": {}})");
         vassert(!tmp.HasParseError(), "Malformed `false` json schema");
         return tmp;
     }();
-    return false_schema;
+    return false_schema.GetObject();
 }
 
 bool is_false_schema(json::Value const& v) {
@@ -1016,18 +522,35 @@ json_type_list normalized_type(json::Value const& v) {
     return ret;
 }
 
+// helper to convert a boolean to a schema
+json::Value::ConstObject
+get_schema(schema_context const&, json::Value const& v) {
+    if (v.IsObject()) {
+        return v.GetObject();
+    }
+
+    if (v.IsBool()) {
+        // in >= draft6 "true/false" is a valid schema and means
+        // {}/{"not":{}}
+        return v.GetBool() ? get_true_schema() : get_false_schema();
+    }
+    throw as_exception(error_info{
+      error_code::schema_invalid,
+      fmt::format(
+        "Invalid JSON Schema, should be object or boolean: '{}'", pj{v})});
+}
+
 // helper to retrieve the object value for a key, or an empty object if the key
 // is not present
-json::Value::ConstObject
-get_object_or_empty(json::Value const& v, std::string_view key) {
+json::Value::ConstObject get_object_or_empty(
+  schema_context const& ctx, json::Value const& v, std::string_view key) {
     auto it = v.FindMember(
       json::Value{key.data(), rapidjson::SizeType(key.size())});
     if (it != v.MemberEnd()) {
-        return it->value.GetObject();
+        return get_schema(ctx, it->value);
     }
 
-    static const auto empty_obj = json::Value{rapidjson::kObjectType};
-    return empty_obj.GetObject();
+    return get_true_schema();
 }
 
 // helper to retrieve the array value for a key, or an empty array if the key
@@ -1145,6 +668,7 @@ bool is_numeric_property_value_superset(
 enum class additional_field_for { object, array };
 
 bool is_additional_superset(
+  context const& ctx,
   json::Value const& older,
   json::Value const& newer,
   additional_field_for field_type) {
@@ -1158,18 +682,30 @@ bool is_additional_superset(
     //  schema  |   true   |  recurse with {}
     //  schema  |   false  |  recurse with {"not":{}}
 
-    auto field_name = [&] {
+    // in draft 2020, if checking "type": "array", "items" is used to represent
+    // additional tuples items instead of an "additionalItems"
+    auto get_field_name = [&](json_schema_dialect d) {
         switch (field_type) {
         case additional_field_for::object:
             return "additionalProperties";
         case additional_field_for::array:
-            return "additionalItems";
+            using enum json_schema_dialect;
+            switch (d) {
+            case draft4:
+            case draft6:
+            case draft7:
+            case draft201909:
+                return "additionalItems";
+            case draft202012:
+                return "items";
+            }
         }
-    }();
+    };
+
     // helper to parse additional__
-    auto get_additional_props =
-      [&](json::Value const& v) -> std::variant<bool, json::Value const*> {
-        auto it = v.FindMember(field_name);
+    auto get_additional_props = [&](json_schema_dialect d, json::Value const& v)
+      -> std::variant<bool, json::Value const*> {
+        auto it = v.FindMember(get_field_name(d));
         if (it == v.MemberEnd()) {
             return true;
         }
@@ -1192,28 +728,28 @@ bool is_additional_superset(
             // older=false -> newer=true  - not compatible
             return older;
         },
-        [](bool older, json::Value const* newer) {
+        [&ctx](bool older, json::Value const* newer) {
             if (older) {
                 // true is compatible with any schema
                 return true;
             }
             // likely false, but need to check
-            return is_superset(get_false_schema(), *newer);
+            return is_superset(ctx, get_false_schema(), *newer);
         },
-        [](json::Value const* older, bool newer) {
+        [&ctx](json::Value const* older, bool newer) {
             if (!newer) {
                 // any schema is compatible with false
                 return true;
             }
             // convert newer to {} and check against that
-            return is_superset(*older, get_true_schema());
+            return is_superset(ctx, *older, get_true_schema());
         },
-        [](json::Value const* older, json::Value const* newer) {
+        [&ctx](json::Value const* older, json::Value const* newer) {
             // check subschemas for compatibility
-            return is_superset(*older, *newer);
+            return is_superset(ctx, *older, *newer);
         }),
-      get_additional_props(older),
-      get_additional_props(newer));
+      get_additional_props(ctx.older.dialect(), older),
+      get_additional_props(ctx.newer.dialect(), newer));
 }
 
 bool is_string_superset(json::Value const& older, json::Value const& newer) {
@@ -1237,11 +773,7 @@ bool is_string_superset(json::Value const& older, json::Value const& newer) {
 
     // both have "pattern". check if they are the same, the only
     // possible_value_accepted
-    auto older_pattern = std::string_view{
-      older_val_p->GetString(), older_val_p->GetStringLength()};
-    auto newer_pattern = std::string_view{
-      newer_val_p->GetString(), newer_val_p->GetStringLength()};
-    return older_pattern == newer_pattern;
+    return as_string_view(*older_val_p) == as_string_view(*newer_val_p);
 }
 
 bool is_numeric_superset(json::Value const& older, json::Value const& newer) {
@@ -1273,14 +805,15 @@ bool is_numeric_superset(json::Value const& older, json::Value const& newer) {
 
     if (!is_numeric_property_value_superset(
           older, newer, "multipleOf", [](double older, double newer) {
-              // check that the reminder of newer/older is close enough to 0, as
-              // in some multiples of epsilon.
+              // check that the reminder of newer/older is close enough to 0.
+              // close enough is defined as being close to the Unit in the Last
+              // Place of the bigger between the two.
               // TODO: this is an approximate check, if a bigdecimal
               // representation it would be possible to perform an exact
               // reminder(newer, older)==0 check
-              return boost::math::epsilon_difference(
-                       std::remainder(newer, older), 0.)
-                     <= 10.;
+              constexpr auto max_ulp_error = 3;
+              return std::abs(std::remainder(newer, older))
+                     <= (max_ulp_error * boost::math::ulp(newer));
           })) {
         return false;
     }
@@ -1290,56 +823,81 @@ bool is_numeric_superset(json::Value const& older, json::Value const& newer) {
     auto exclusive_limit_check = [](
                                    json::Value const& older,
                                    json::Value const& newer,
-                                   std::string_view prop_name) {
-        auto [maybe_gate_value, older_it, newer_it]
-          = extract_property_and_gate_check(older, newer, prop_name);
-        if (maybe_gate_value.has_value()) {
-            return maybe_gate_value.value();
-        }
-        // need to perform checks on actual values
-        if (older_it->IsBool() && newer_it->IsBool()) {
-            // both have value and can be decoded as bool
-            if (older_it->GetBool() == true && newer_it->GetBool() == false) {
-                // newer represent a larger range
-                return false;
-            } else {
-                // either equal value or newer represent a smaller range
-                return true;
+                                   std::string_view prop_name,
+                                   std::invocable<double, double> auto pred) {
+        auto get_value = [=](json::Value const& v)
+          -> std::variant<std::monostate, bool, double> {
+            auto it = v.FindMember(json::Value{
+              prop_name.data(), rapidjson::SizeType(prop_name.size())});
+            if (it == v.MemberEnd()) {
+                return std::monostate{};
             }
-        }
-
-        if (older_it->IsDouble() && newer_it->IsDouble()) {
-            // TODO extend this for double
+            if (it->value.IsBool()) {
+                return it->value.GetBool();
+            }
+            if (it->value.IsLosslessDouble()) {
+                return it->value.GetDouble();
+            }
+            // v could not be decodes as a double, likely a malformed json
             throw as_exception(invalid_schema(fmt::format(
-              R"({}-{} not implemented for types other than "boolean". input: older: '{}', newer: '{}')",
-              __FUNCTION__,
+              R"(is_numeric_superset-{} not implemented for types other than "boolean" and "number". input: '{}')",
               prop_name,
-              pj{older},
-              pj{newer})));
-        } else {
-            // types changes are always not compatible (one is boolean and the
-            // other is double)
-            return false;
-        }
+              pj{v})));
+        };
+
+        return std::visit(
+          ss::make_visitor(
+            [](bool older, bool newer) {
+                // compatible if no change or if older was not "exclusive"
+                return older == newer || older == false;
+            },
+            [](bool older, std::monostate) {
+                // monostate defaults to false, compatible if older is false
+                return older == false;
+            },
+            [&](double older, double newer) {
+                // delegate to pred
+                return std::invoke(pred, older, newer);
+            },
+            [](double, std::monostate) {
+                // newer is less strict than older
+                return false;
+            },
+            [](std::monostate, auto) {
+                // older has no rules, compatible with everything
+                return true;
+            },
+            [&](auto, auto) -> bool {
+                throw as_exception(invalid_schema(fmt::format(
+                  R"(is_numeric_superset-{} not implemented for mixed types: older: '{}', newer: '{}')",
+                  prop_name,
+                  pj{older},
+                  pj{newer})));
+            }),
+          get_value(older),
+          get_value(newer));
     };
 
-    if (!exclusive_limit_check(older, newer, "exclusiveMinimum")) {
+    if (!exclusive_limit_check(
+          older, newer, "exclusiveMinimum", std::less_equal<>{})) {
         return false;
     }
 
-    if (!exclusive_limit_check(older, newer, "exclusiveMaximum")) {
+    if (!exclusive_limit_check(
+          older, newer, "exclusiveMaximum", std::greater_equal<>{})) {
         return false;
     }
 
     return true;
 }
 
-bool is_array_superset(json::Value const& older, json::Value const& newer) {
+bool is_array_superset(
+  context const& ctx, json::Value const& older, json::Value const& newer) {
     // "type": "array" is used to model an array or a tuple.
     // for array, "items" is a schema that validates all the elements.
     // for tuple in Draft4, "items" is an array of schemas to validate the
-    // tuple, and "additionaItems" a schema to validate extra elements.
-    // TODO in later drafts, tuple validation has "prefixItems" as array of
+    // tuple, and "additionalItems" a schema to validate extra elements.
+    // from draft 2020, tuple validation has "prefixItems" as array of
     // schemas, "items" is for validation of extra elements, "additionalItems"
     // is not used.
     // This superset function has a common section for tuples and array, and
@@ -1381,35 +939,60 @@ bool is_array_superset(json::Value const& older, json::Value const& newer) {
         return false;
     }
 
-    // check if the input is an array schema or a tuple schema
-    auto is_array = [](json::Value const& v) -> bool {
-        // TODO "prefixItems" is not in Draft4, it's from later drafts. if it's
-        // present, it's a tuple schema
-        auto items_it = v.FindMember("items");
-        // default for items is `{}` so it's not a tuple schema
-        // v is a tuple schema if "items" is an array of schemas
-        auto is_tuple = items_it != v.MemberEnd() && items_it->value.IsArray();
-        return !is_tuple;
+    // in draft 2020, "prefixItems" is used to represent tuples instead of an
+    // overloaded "items"
+    constexpr static auto get_tuple_items_kw = [](json_schema_dialect d) {
+        using enum json_schema_dialect;
+        switch (d) {
+        case draft4:
+        case draft6:
+        case draft7:
+        case draft201909:
+            return "items";
+        case draft202012:
+            return "prefixItems";
+        }
+    };
+    constexpr static auto get_additional_items_kw = [](json_schema_dialect d) {
+        using enum json_schema_dialect;
+        switch (d) {
+        case draft4:
+        case draft6:
+        case draft7:
+        case draft201909:
+            return "additionalItems";
+        case draft202012:
+            return "items";
+        }
     };
 
-    auto older_is_array = is_array(older);
-    auto newer_is_array = is_array(newer);
+    // check if the input is an array schema or a tuple schema
+    auto is_tuple = [](json_schema_dialect d, json::Value const& v) -> bool {
+        auto tuple_items_it = v.FindMember(get_tuple_items_kw(d));
+        // default for items is `{}` so it's not a tuple schema
+        // v is a tuple schema if "items" is an array of schemas
+        return tuple_items_it != v.MemberEnd()
+               && tuple_items_it->value.IsArray();
+    };
 
-    if (older_is_array != newer_is_array) {
+    auto older_is_tuple = is_tuple(ctx.older.dialect(), older);
+    auto newer_is_tuple = is_tuple(ctx.newer.dialect(), newer);
+
+    if (older_is_tuple != newer_is_tuple) {
         // one is a tuple and the other is not. not compatible
         return false;
     }
     // both are tuples or both are arrays
 
-    if (older_is_array) {
+    if (!older_is_tuple) {
         // both are array, only "items" is relevant and it's a schema
-        // TODO after draft 4 "items" can be also a boolean so this needs to
-        // account for that note that "additionalItems" can be defined, but it's
+        // note that "additionalItems" can be defined, but it's
         // not used by validation because every element is validated against
         // "items"
         return is_superset(
-          get_object_or_empty(older, "items"),
-          get_object_or_empty(newer, "items"));
+          ctx,
+          get_object_or_empty(ctx.older, older, "items"),
+          get_object_or_empty(ctx.newer, newer, "items"));
     }
 
     // both are tuple schemas, validation is similar to object. one side
@@ -1417,15 +1000,22 @@ bool is_array_superset(json::Value const& older, json::Value const& newer) {
 
     // first check is for "additionalItems" compatibility, it's cheaper than the
     // rest
-    if (!is_additional_superset(older, newer, additional_field_for::array)) {
+    if (!is_additional_superset(
+          ctx, older, newer, additional_field_for::array)) {
         return false;
     }
 
-    auto older_tuple_schema = older["items"].GetArray();
-    auto newer_tuple_schema = newer["items"].GetArray();
+    auto older_tuple_schema
+      = older[get_tuple_items_kw(ctx.older.dialect())].GetArray();
+    auto newer_tuple_schema
+      = newer[get_tuple_items_kw(ctx.newer.dialect())].GetArray();
     // find the first pair of schemas that do not match
     auto [older_it, newer_it] = std::ranges::mismatch(
-      older_tuple_schema, newer_tuple_schema, is_superset);
+      older_tuple_schema,
+      newer_tuple_schema,
+      [&ctx](auto const& older, auto const& newer) {
+          return is_superset(ctx, older, newer);
+      });
 
     if (
       older_it != older_tuple_schema.end()
@@ -1436,35 +1026,36 @@ bool is_array_superset(json::Value const& older, json::Value const& newer) {
         return false;
     }
 
-    // no mismatching elements. two possible cases
-    // 1. older_tuple_schema.Size() >= newer_tuple_schema.Size() ->
-    // compatible (implies newer_it==end())
-    // 2. older_tuple_schema.Size() <  newer_tuple_schema.Size() -> check
-    // excess elements with older["additionalItems"]
+    // no mismatching elements, and they don't have the same size.
+    // To be compatible, excess elements needs to be compatible with the other
+    // "additionalItems" schema
 
-    auto const& older_additional_schema = [&]() -> json::Value const& {
-        auto older_it = older.FindMember("additionalItems");
-        if (older_it == older.MemberEnd()) {
-            // default is `true`
-            return get_true_schema();
-        }
-        if (older_it->value.IsBool()) {
-            return older_it->value.GetBool() ? get_true_schema()
-                                             : get_false_schema();
-        }
-        return older_it->value;
-    }();
+    auto older_additional_schema = get_object_or_empty(
+      ctx.older, older, get_additional_items_kw(ctx.older.dialect()));
+    if (!std::all_of(
+          newer_it, newer_tuple_schema.end(), [&](json::Value const& n) {
+              return is_superset(ctx, older_additional_schema, n);
+          })) {
+        // newer has excess elements that are not compatible with
+        // older["additionalItems"]
+        return false;
+    }
 
-    // check that all excess schemas are compatible with
-    // older["additionalItems"]
-    return std::all_of(
-      newer_it, newer_tuple_schema.end(), [&](json::Value const& n) {
-          return is_superset(older_additional_schema, n);
-      });
+    auto newer_additional_schema = get_object_or_empty(
+      ctx.newer, newer, get_additional_items_kw(ctx.newer.dialect()));
+    if (!std::all_of(
+          older_it, older_tuple_schema.end(), [&](json::Value const& o) {
+              return is_superset(ctx, o, newer_additional_schema);
+          })) {
+        // older has excess elements that are not compatible with
+        // newer["additionalItems"]
+        return false;
+    }
+    return true;
 }
 
 bool is_object_properties_superset(
-  json::Value const& older, json::Value const& newer) {
+  context const& ctx, json::Value const& older, json::Value const& newer) {
     // check that every property in newer["properties"]
     // if it appears in older["properties"],
     //    then it has to be compatible with the schema
@@ -1473,40 +1064,27 @@ bool is_object_properties_superset(
     // or
     //    it has to be compatible with older["additionalProperties"]
 
-    auto newer_properties = get_object_or_empty(newer, "properties");
+    auto newer_properties = get_object_or_empty(ctx.newer, newer, "properties");
     if (newer_properties.ObjectEmpty()) {
         // no "properties" in newer, all good
         return true;
     }
 
     // older["properties"] is a map of <prop, schema>
-    auto older_properties = get_object_or_empty(older, "properties");
+    auto older_properties = get_object_or_empty(ctx.older, older, "properties");
     // older["patternProperties"] is a map of <pattern, schema>
     auto older_pattern_properties = get_object_or_empty(
-      older, "patternProperties");
+      ctx.older, older, "patternProperties");
     // older["additionalProperties"] is a schema
-    auto get_older_additional_properties = [&]() -> json::Value const& {
-        auto older_it = older.FindMember("additionalProperties");
-        if (older_it == older.MemberEnd()) {
-            // default is `true`
-            return get_true_schema();
-        }
-
-        if (older_it->value.IsBool()) {
-            return older_it->value.GetBool() ? get_true_schema()
-                                             : get_false_schema();
-        }
-
-        return older_it->value;
-    };
-
+    auto older_additional_properties = get_object_or_empty(
+      ctx.older, older, "additionalProperties");
     // scan every prop in newer["properties"]
     for (auto const& [prop, schema] : newer_properties) {
         // it is either an evolution of a schema in older["properties"]
         if (auto older_it = older_properties.FindMember(prop);
             older_it != older_properties.MemberEnd()) {
             // prop exists in both
-            if (!is_superset(older_it->value, schema)) {
+            if (!is_superset(ctx, older_it->value, schema)) {
                 // not compatible
                 return false;
             }
@@ -1517,16 +1095,14 @@ bool is_object_properties_superset(
         // or it should be checked against every schema in
         // older["patternProperties"] that matches
         auto pattern_match_found = false;
-        for (auto pname
-             = std::string_view{prop.GetString(), prop.GetStringLength()};
+        for (auto pname = as_string_view(prop);
              auto const& [propPattern, schemaPattern] :
              older_pattern_properties) {
             // TODO this rebuilds the regex each time, could be cached
-            auto regex = re2::RE2(std::string_view{
-              propPattern.GetString(), propPattern.GetStringLength()});
+            auto regex = re2::RE2(as_string_view(propPattern));
             if (re2::RE2::PartialMatch(pname, regex)) {
                 pattern_match_found = true;
-                if (!is_superset(schemaPattern, schema)) {
+                if (!is_superset(ctx, schemaPattern, schema)) {
                     // not compatible
                     return false;
                 }
@@ -1537,36 +1113,7 @@ bool is_object_properties_superset(
         // in patternProperties was found
         if (
           !pattern_match_found
-          && !is_superset(get_older_additional_properties(), schema)) {
-            // not compatible
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool is_object_pattern_properties_superset(
-  json::Value const& older, json::Value const& newer) {
-    // check that every pattern property in newer["patternProperties"]
-    // appears in older["patternProperties"] and is compatible with the schema
-
-    // "patternProperties" is a map of <pattern, schema>
-    auto newer_pattern_properties = get_object_or_empty(
-      newer, "patternProperties");
-    auto older_pattern_properties = get_object_or_empty(
-      older, "patternProperties");
-
-    // TODO O(n^2) lookup
-    for (auto const& [pattern, schema] : newer_pattern_properties) {
-        // search for pattern in older_pattern_properties and check schemas
-        auto older_pp_it = older_pattern_properties.FindMember(pattern);
-        if (older_pp_it == older_pattern_properties.MemberEnd()) {
-            // pattern not in older["patternProperties"], not compatible
-            return false;
-        }
-
-        if (!is_superset(older_pp_it->value, schema)) {
+          && !is_superset(ctx, older_additional_properties, schema)) {
             // not compatible
             return false;
         }
@@ -1576,55 +1123,91 @@ bool is_object_pattern_properties_superset(
 }
 
 bool is_object_required_superset(
-  json::Value const& older, json::Value const& newer) {
+  context const& ctx, json::Value const& older, json::Value const& newer) {
     // to pass the check, a required property from newer has to be present in
-    // older, or if new it needs to be without a default value note that:
+    // older, or if new it needs to have a default value.
+    // note that:
     // 1. we check only required properties that are in both newer["properties"]
     // and older["properties"]
     // 2. there is no explicit check that older has an open content model
     //    there might be a property name outside of (1) that could be rejected
-    //    by older, if older["additionalProperties"] is false
+    //    by update, if update["additionalProperties"] is false
 
     auto older_req = get_array_or_empty(older, "required");
     auto newer_req = get_array_or_empty(newer, "required");
-    auto older_props = get_object_or_empty(older, "properties");
-    auto newer_props = get_object_or_empty(newer, "properties");
+    auto older_props = get_object_or_empty(ctx.older, older, "properties");
+    auto newer_props = get_object_or_empty(ctx.newer, newer, "properties");
 
-    // TODO O(n^2) lookup that can be a set_intersection
-    auto newer_props_in_older = older_props
-                                | std::views::transform([&](auto& n_v) {
-                                      return newer_props.FindMember(n_v.name);
-                                  })
-                                | std::views::filter(
-                                  [end = newer_props.end()](auto it) {
-                                      return it != end;
-                                  });
-    // intersections of older["properties"] and newer["properties"]
-    for (auto prop_it : newer_props_in_older) {
-        auto& [name, newer_schema] = *prop_it;
+    // TODO O(n^2) lookup that can be a set_intersection.
+    auto older_req_in_both_properties
+      = older_req | std::views::filter([&](json::Value const& o) {
+            return newer_props.HasMember(o) && older_props.HasMember(o);
+        });
 
-        auto older_is_required = std::ranges::find(older_req, name)
-                                 != older_req.end();
-        auto newer_is_required = std::ranges::find(newer_req, name)
-                                 != newer_req.end();
-        if (older_is_required && !newer_is_required) {
-            // required property not present in newer, not compatible
-            return false;
-        }
-
-        if (!older_is_required && newer_is_required) {
-            if (newer_schema.HasMember("default")) {
-                // newer required property with a default makes newer
-                // incompatible
-                return false;
-            }
-        }
-    }
-
-    return true;
+    // for each element:
+    // in older.required? | in newer.required? | result
+    //       yes          |        yes         |  yes
+    //       yes          |         no         |  if it has "default" in older
+    //       no           |        yes         |  yes
+    return std::ranges::all_of(
+      older_req_in_both_properties, [&](json::Value const& o) {
+          return std::ranges::find(newer_req, o) != newer_req.End()
+                 || older_props[o].HasMember("default");
+      });
 }
 
-bool is_object_superset(json::Value const& older, json::Value const& newer) {
+bool is_object_dependencies_superset(
+  context const& ctx, json::Value const& older, json::Value const& newer) {
+    // "dependencies", if present, is a dict of <property, string_array |
+    // schema>. To be compatible, each key in older has to be in newer and the
+    // values have to be of the same type and compatible.
+    // older string array needs to be a subset of newer string array.
+    // older schema needs to be compatible with newer schema
+
+    auto [maybe_skip, older_p, newer_p] = extract_property_and_gate_check(
+      older, newer, "dependencies");
+    if (maybe_skip.has_value()) {
+        return maybe_skip.value();
+    }
+    // older and newer have "dependencies"
+
+    // all dependencies in older need to carry over in newer, and need to be
+    // compatible
+    // TODO: n^2 search
+    return std::ranges::all_of(
+      older_p->GetObject(),
+      [&ctx,
+       newer_dep = newer_p->GetObject()](json::Value::Member const& older_dep) {
+          auto n_it = newer_dep.FindMember(older_dep.name);
+          if (n_it == newer_dep.MemberEnd()) {
+              // dependency definition removed, not compatible
+              return false;
+          }
+
+          // check that the dependency values for this name are compatible
+          auto const& o = older_dep.value;
+          auto const& n = n_it->value;
+
+          if (o.IsArray() && n.IsArray()) {
+              // string array: n needs to be a a superset of o
+              // TODO: n^2 search
+              return std::ranges::all_of(
+                o.GetArray(), [n_array = n.GetArray()](json::Value const& p) {
+                    return std::ranges::find(n_array, p) != n_array.End();
+                });
+          }
+
+          if (o.IsObject() && n.IsObject()) {
+              // schemas: o and n needs to be compatible
+              return is_superset(ctx, o, n);
+          }
+
+          return false;
+      });
+}
+
+bool is_object_superset(
+  context const& ctx, json::Value const& older, json::Value const& newer) {
     if (!is_numeric_property_value_superset(
           older, newer, "minProperties", std::less_equal<>{}, 0)) {
         // newer requires less properties to be set
@@ -1635,11 +1218,12 @@ bool is_object_superset(json::Value const& older, json::Value const& newer) {
         // newer requires more properties to be set
         return false;
     }
-    if (!is_additional_superset(older, newer, additional_field_for::object)) {
+    if (!is_additional_superset(
+          ctx, older, newer, additional_field_for::object)) {
         // additional properties are not compatible
         return false;
     }
-    if (!is_object_properties_superset(older, newer)) {
+    if (!is_object_properties_superset(ctx, older, newer)) {
         // "properties" in newer might not be compatible with
         // older["properties"] (incompatible evolution) or
         // older["patternProperties"] (it is not compatible with the pattern
@@ -1648,12 +1232,20 @@ bool is_object_superset(json::Value const& older, json::Value const& newer) {
         // newer)
         return false;
     }
-    if (!is_object_pattern_properties_superset(older, newer)) {
-        // pattern properties checks are not compatible
+
+    // note: to match the behavior of the legacy software,
+    // ```
+    // if(!is_object_pattern_properties_superset(ctx, older, newer))
+    //   return false;
+    // ```
+    // is omitted
+
+    if (!is_object_required_superset(ctx, older, newer)) {
+        // required properties are not compatible
         return false;
     }
-    if (!is_object_required_superset(older, newer)) {
-        // required properties are not compatible
+    if (!is_object_dependencies_superset(ctx, older, newer)) {
+        // dependencies are not compatible
         return false;
     }
 
@@ -1702,7 +1294,7 @@ bool is_enum_superset(json::Value const& older, json::Value const& newer) {
 }
 
 bool is_not_combinator_superset(
-  json::Value const& older, json::Value const& newer) {
+  context const& ctx, json::Value const& older, json::Value const& newer) {
     auto older_it = older.FindMember("not");
     auto newer_it = newer.FindMember("not");
     auto older_has_not = older_it != older.MemberEnd();
@@ -1717,12 +1309,167 @@ bool is_not_combinator_superset(
         // for not combinator, we want to check if the "not" newer subschema is
         // less strict than the older subschema, because this means that newer
         // validated less data than older
-        return is_superset(newer_it->value, older_it->value);
+        return is_superset(
+          {ctx.newer, ctx.older}, newer_it->value, older_it->value);
     }
 
     // both do not have a "not" key, compatible
     return true;
 }
+
+enum class p_combinator { oneOf, allOf, anyOf };
+json::Value to_keyword(p_combinator c) {
+    switch (c) {
+    case p_combinator::oneOf:
+        return json::Value{"oneOf"};
+    case p_combinator::allOf:
+        return json::Value{"allOf"};
+    case p_combinator::anyOf:
+        return json::Value{"anyOf"};
+    }
+}
+
+bool is_positive_combinator_superset(
+  context const& ctx, json::Value const& older, json::Value const& newer) {
+    auto get_combinator = [](json::Value const& v) {
+        auto res = std::optional<p_combinator>{};
+        for (auto c :
+             {p_combinator::oneOf, p_combinator::allOf, p_combinator::anyOf}) {
+            if (v.HasMember(to_keyword(c))) {
+                if (res.has_value()) {
+                    // ensure that only one combinator is present in the schema.
+                    // json schema allows more than one of {"oneOf", "anyOf",
+                    // "allOf"} to appear, but it's not currently supported for
+                    // is_superset
+                    throw as_exception(invalid_schema(
+                      fmt::format("{} has more than one combinator", pj{v})));
+                }
+                res = c;
+            }
+        }
+        return res;
+    };
+
+    auto maybe_older_comb = get_combinator(older);
+    auto maybe_newer_comb = get_combinator(newer);
+    if (!maybe_older_comb.has_value()) {
+        // older has not a combinator, maximum freedom for newer. compatible
+        return true;
+    }
+    // older has a combinator
+
+    if (!maybe_newer_comb.has_value()) {
+        // older has a combinator but newer does not. not compatible
+        return false;
+    }
+    // newer has a combinator
+
+    auto older_comb = maybe_older_comb.value();
+    auto newer_comb = maybe_newer_comb.value();
+    auto older_schemas
+      = older.FindMember(to_keyword(older_comb))->value.GetArray();
+    auto newer_schemas
+      = newer.FindMember(to_keyword(newer_comb))->value.GetArray();
+
+    if (older_comb != p_combinator::anyOf && older_comb != newer_comb) {
+        // different combinators, and older is not "anyOf". there might some
+        // compatible combinations:
+
+        if (older_schemas.Size() == 1 && newer_schemas.Size() == 1) {
+            // both combinators have only one subschema, so the actual
+            // combinator does not matter. compare subschemas directly
+            return is_superset(
+              ctx, *older_schemas.Begin(), *newer_schemas.Begin());
+        }
+
+        // either older or newer - or both - has more than one subschema
+
+        if (older_schemas.Size() == 1 && newer_comb == p_combinator::allOf) {
+            // older has only one subschema, newer is "allOf" so it can be
+            // compatible if any one of the subschemas matches older
+            return std::ranges::any_of(
+              newer_schemas, [&](json::Value const& s) {
+                  return is_superset(ctx, *older_schemas.Begin(), s);
+              });
+        }
+
+        if (older_comb == p_combinator::oneOf && newer_schemas.Size() == 1) {
+            // older has multiple schemas but only one can be valid. it's
+            // compatible if the only subschema in newer is compatible with one
+            // in older
+            return std::ranges::any_of(
+              older_schemas, [&](json::Value const& s) {
+                  return is_superset(ctx, s, *newer_schemas.Begin());
+              });
+        }
+
+        // different combinators, not a special case. not compatible
+        return false;
+    }
+
+    // same combinator for older and newer, or older is "anyOf"
+
+    // size differences between older_schemas and newer_schemas have different
+    // meaning based on combinator.
+    // TODO a denormalized schema could fail this check while being compatible
+    if (older_schemas.Size() > newer_schemas.Size()) {
+        if (older_comb == p_combinator::allOf) {
+            // older has more restrictions than newer, not compatible
+            return false;
+        }
+    } else if (older_schemas.Size() < newer_schemas.Size()) {
+        if (
+          newer_comb == p_combinator::anyOf
+          || newer_comb == p_combinator::oneOf) {
+            // newer has more degrees of freedom than older, not compatible
+            return false;
+        }
+    }
+
+    // sizes are compatible, now we need to check that every schema from
+    // the smaller schema array has a unique compatible schema.
+    // To do so, we construct a bipartite graphs of the schemas with a vertex
+    // for each schema, and an edge for each pair (o ∈ older_schemas, n ∈
+    // newer_schemas), if is_superset(o, n). Then we compute the
+    // maximum_cardinality_matching and the result is compatible if all the
+    // schemas from the smaller schema_array are connected in this match. NOTE:
+    // older_schemas will have index [0, older_schemas.size()), newer_schemas
+    // will have index [older_schemas.size(),
+    // older_schemas.size()+newer_schemas.size()).
+    // TODO during this phase, all the subschemas from the smaller schema array
+    // need to have at least an edge, so we can early exit if is_superset if
+    // false for all the possible edges
+    using graph_t
+      = boost::adjacency_list<boost::vecS, boost::vecS, boost::undirectedS>;
+    auto superset_graph = graph_t{older_schemas.Size() + newer_schemas.Size()};
+    for (auto o = 0u; o < older_schemas.Size(); ++o) {
+        for (auto n = 0u; n < newer_schemas.Size(); ++n) {
+            if (is_superset(ctx, older_schemas[o], newer_schemas[n])) {
+                // translate n for the graph
+                auto n_index = n + older_schemas.Size();
+                add_edge(o, n_index, superset_graph);
+            }
+        }
+    }
+
+    // find if for each sub_schema there is a distinct compatible sub_schema
+    auto mate_res = std::vector<graph_t::vertex_descriptor>(
+      superset_graph.vertex_set().size());
+    boost::edmonds_maximum_cardinality_matching(
+      superset_graph, mate_res.data());
+
+    if (
+      matching_size(superset_graph, mate_res.data())
+      != std::min(older_schemas.Size(), newer_schemas.Size())) {
+        // one of  sub schema was left out, meaning that it either had no valid
+        // is_superset() relation with the other schema array, or that the
+        // algorithm couldn't find a unique compatible pattern.
+        return false;
+    }
+
+    return true;
+}
+
 } // namespace is_superset_impl
 
 using namespace is_superset_impl;
@@ -1730,13 +1477,19 @@ using namespace is_superset_impl;
 // a schema O is a superset of another schema N if every schema that is valid
 // for N is also valid for O. precondition: older and newer are both valid
 // schemas
-bool is_superset(json::Value const& older, json::Value const& newer) {
+bool is_superset(
+  context const& ctx,
+  json::Value const& older_schema,
+  json::Value const& newer_schema) {
     // break recursion if parameters are atoms:
-    if (is_true_schema(older) || is_false_schema(newer)) {
+    if (is_true_schema(older_schema) || is_false_schema(newer_schema)) {
         // either older is the superset of every possible schema, or newer is
         // the subset of every possible schema
         return true;
     }
+
+    auto older = get_schema(ctx.older, older_schema);
+    auto newer = get_schema(ctx.newer, newer_schema);
 
     // extract { "type" : ... }
     auto older_types = normalized_type(older);
@@ -1777,12 +1530,12 @@ bool is_superset(json::Value const& older, json::Value const& newer) {
             }
             break;
         case json_type::object:
-            if (!is_object_superset(older, newer)) {
+            if (!is_object_superset(ctx, older, newer)) {
                 return false;
             }
             break;
         case json_type::array:
-            if (!is_array_superset(older, newer)) {
+            if (!is_array_superset(ctx, older, newer)) {
                 return false;
             }
             break;
@@ -1799,34 +1552,17 @@ bool is_superset(json::Value const& older, json::Value const& newer) {
         return false;
     }
 
-    if (!is_not_combinator_superset(older, newer)) {
+    if (!is_not_combinator_superset(ctx, older, newer)) {
+        return false;
+    }
+
+    if (!is_positive_combinator_superset(ctx, older, newer)) {
         return false;
     }
 
     for (auto not_yet_handled_keyword : {
-           "$schema",
-           "definitions",
-           "dependencies",
-           "allOf",
-           "anyOf",
-           "oneOf",
            // draft 6 unhandled keywords:
-           "$comment",
            "$ref",
-           "const",
-           "contains",
-           "examples",
-           "propertyNames",
-           // draft 7 unhandled keywords
-           "contentEncoding",
-           "contentMediaType",
-           "readOnly",
-           "writeOnly",
-           "if",
-           "then",
-           "else",
-           // later drafts:
-           "prefixItems",
          }) {
         if (
           newer.HasMember(not_yet_handled_keyword)
@@ -1847,43 +1583,83 @@ bool is_superset(json::Value const& older, json::Value const& newer) {
     return true;
 }
 
+void sort(json::Value& val) {
+    switch (val.GetType()) {
+    case rapidjson::Type::kFalseType:
+    case rapidjson::Type::kNullType:
+    case rapidjson::Type::kNumberType:
+    case rapidjson::Type::kStringType:
+    case rapidjson::Type::kTrueType:
+        break;
+    case rapidjson::Type::kArrayType: {
+        for (auto& v : val.GetArray()) {
+            sort(v);
+        }
+        break;
+    }
+    case rapidjson::Type::kObjectType: {
+        auto v = val.GetObject();
+        std::sort(v.begin(), v.end(), [](auto& lhs, auto& rhs) {
+            return as_string_view(lhs.name) < as_string_view(rhs.name);
+        });
+    }
+    }
+}
+
 } // namespace
 
 ss::future<json_schema_definition>
 make_json_schema_definition(sharded_store&, canonical_schema schema) {
-    auto doc = parse_json(schema.def().raw()()).value(); // throws on error
+    auto doc
+      = parse_json(schema.def().shared_raw()()).value(); // throws on error
     std::string_view name = schema.sub()();
     auto refs = std::move(schema).def().refs();
     co_return json_schema_definition{
-      ss::make_shared<json_schema_definition::impl>(std::move(doc), name),
-      std::move(refs)};
+      ss::make_shared<json_schema_definition::impl>(
+        std::move(doc), name, std::move(refs))};
 }
 
-ss::future<canonical_schema>
-make_canonical_json_schema(sharded_store& store, unparsed_schema def) {
-    // TODO BP: More validation and normalisation
-    parse_json(def.def().raw()()).value(); // throws on error
-    auto raw_def = std::move(def).def();
-    auto schema = canonical_schema{
-      // NOLINTNEXTLINE(bugprone-use-after-move)
-      def.sub(),
-      canonical_schema_definition{// NOLINTNEXTLINE(bugprone-use-after-move)
-                                  std::move(raw_def).raw(),
-                                  def.type(),
-                                  // NOLINTNEXTLINE(bugprone-use-after-move)
-                                  std::move(raw_def).refs()}};
+ss::future<canonical_schema> make_canonical_json_schema(
+  sharded_store& store, unparsed_schema unparsed_schema, normalize norm) {
+    auto [sub, unparsed] = std::move(unparsed_schema).destructure();
+    auto [def, type, refs] = std::move(unparsed).destructure();
+
+    auto ctx = parse_json(std::move(def)).value(); // throws on error
+    if (norm) {
+        sort(ctx.doc);
+        std::sort(refs.begin(), refs.end());
+        refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+    }
+    json::chunked_buffer out;
+    json::Writer<json::chunked_buffer> w{out};
+    ctx.doc.Accept(w);
+
+    canonical_schema schema{
+      std::move(sub),
+      canonical_schema_definition{
+        canonical_schema_definition::raw_string{std::move(out).as_iobuf()},
+        type,
+        std::move(refs)}};
 
     // Ensure all references exist
-    co_await check_references(store, schema);
+    co_await check_references(store, schema.share());
 
     co_return schema;
 }
 
-bool check_compatible(
-  const json_schema_definition& reader, const json_schema_definition& writer) {
-    // reader is a superset of writer iff every schema that is valid for writer
-    // is also valid for reader
-    return is_superset(reader().doc, writer().doc);
+compatibility_result check_compatible(
+  const json_schema_definition& reader,
+  const json_schema_definition& writer,
+  verbose is_verbose [[maybe_unused]]) {
+    auto is_compatible = [&]() {
+        // reader is a superset of writer iff every schema that is valid for
+        // writer is also valid for reader
+        context ctx{.older{reader()}, .newer{writer()}};
+        return is_superset(ctx, reader().ctx.doc, writer().ctx.doc);
+    }();
+
+    // TODO(gellert.nagy): start using the is_verbose flag in a follow up PR
+    return compatibility_result{.is_compat = is_compatible};
 }
 
 } // namespace pandaproxy::schema_registry

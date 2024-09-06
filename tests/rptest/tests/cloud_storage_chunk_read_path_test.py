@@ -232,12 +232,6 @@ class CloudStorageChunkReadTest(PreallocNodesTest):
             self._assert_not_in_cache(
                 fr'.*kafka/{self.topic}/.*\.log\.[0-9]+$')
 
-            # We cannot assert that there are chunks in cache because the deleting thread
-            # could delete them all before we run the assertion, causing it to fail.
-            # We can check that the thread deleted some chunks.
-            assert rm_chunks.deleted_chunks > 0, "Expected to delete some chunk files during rand-cons, none deleted"
-            rm_chunks.deleted_chunks = 0
-
             consumer = KgoVerifierSeqConsumer(self.test_context,
                                               self.redpanda,
                                               self.topic,
@@ -247,7 +241,7 @@ class CloudStorageChunkReadTest(PreallocNodesTest):
             consumer.wait(timeout_sec=120)
             rm_chunks.stop()
             rm_chunks.join(timeout=10)
-            assert rm_chunks.deleted_chunks > 0, "Expected to delete some chunk files during seq-cons, none deleted"
+            assert rm_chunks.deleted_chunks > 0, "Expected to delete some chunk files, none deleted"
 
             self._assert_not_in_cache(
                 fr'.*kafka/{self.topic}/.*\.log\.[0-9]+$')
@@ -506,10 +500,6 @@ class DeleteRandomChunks(Thread):
         self.n_delete = n_delete
         self.deleted_chunks = 0
 
-        leader_id = Admin(self.redpanda).get_partition_leader(
-            namespace='kafka', topic=self.topic, partition=0)
-        self.leader = self.redpanda.get_node_by_id(leader_id)
-
     def run(self) -> None:
         cmd = f"""
 find {self.redpanda.DATA_DIR}/cloud_storage_cache -regex '.*kafka/{self.topic}/.*_chunks/[0-9]+' -print0 |\
@@ -518,11 +508,15 @@ find {self.redpanda.DATA_DIR}/cloud_storage_cache -regex '.*kafka/{self.topic}/.
  xargs --no-run-if-empty --null rm -v"""
         while not self.stop_requested:
             sleep(self.sleep_interval)
-            if self.leader in self.redpanda.started_nodes():
+            leader_id = Admin(self.redpanda).get_partition_leader(
+                namespace='kafka', topic=self.topic, partition=0)
+            leader_node = self.redpanda.get_node_by_id(leader_id)
+
+            if leader_node in self.redpanda.started_nodes():
                 try:
-                    for row in self.leader.account.ssh_capture(cmd):
+                    for row in leader_node.account.ssh_capture(cmd):
                         self.redpanda.logger.debug(
-                            f'{self.leader.account.hostname}: {row.strip()}')
+                            f'{leader_node.account.hostname}: {row.strip()}')
                         self.deleted_chunks += 1
                 except Exception as ex:
                     self.redpanda.logger.info(

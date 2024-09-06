@@ -296,7 +296,8 @@ inline void rjson_serialize(
 }
 
 inline void rjson_serialize(
-  json::Writer<json::StringBuffer>& w, const cluster::node_health_report& f) {
+  json::Writer<json::StringBuffer>& w,
+  const cluster::node_health_report_serde& f) {
     w.StartObject();
     w.Key("id");
     rjson_serialize(w, f.id);
@@ -335,7 +336,7 @@ inline void rjson_serialize(
     w.Key("node_reports");
     w.StartArray();
     for (auto& r : f.node_reports) {
-        rjson_serialize(w, *r);
+        rjson_serialize(w, cluster::node_health_report_serde{*r});
     }
     w.EndArray();
     w.EndObject();
@@ -429,7 +430,7 @@ inline void read_value(json::Value const& rd, cluster::node::local_state& obj) {
 }
 
 inline void
-read_value(json::Value const& rd, cluster::node_health_report& obj) {
+read_value(json::Value const& rd, cluster::node_health_report_serde& obj) {
     model::node_id id;
     cluster::node::local_state local_state;
     chunked_vector<cluster::topic_status> topics;
@@ -439,12 +440,8 @@ read_value(json::Value const& rd, cluster::node_health_report& obj) {
     read_member(rd, "local_state", local_state);
     read_member(rd, "topics", topics);
     read_member(rd, "drain_status", drain_status);
-    obj = cluster::node_health_report(
-      id,
-      local_state,
-      std::move(topics),
-      drain_status.has_value(),
-      drain_status);
+    obj = cluster::node_health_report_serde(
+      id, local_state, std::move(topics), drain_status);
 }
 
 inline void read_value(json::Value const& rd, cluster::node_state& obj) {
@@ -470,11 +467,11 @@ read_value(json::Value const& rd, cluster::cluster_health_report& obj) {
     auto reports_v = rd.FindMember("node_reports");
     if (reports_v != rd.MemberEnd()) {
         for (auto const& e : reports_v->value.GetArray()) {
-            cluster::node_health_report report;
+            cluster::node_health_report_serde report;
             read_value(e, report);
             node_reports.emplace_back(
               ss::make_lw_shared<cluster::node_health_report>(
-                std::move(report)));
+                std::move(report).to_in_memory()));
         }
     }
     obj = cluster::cluster_health_report{
@@ -573,6 +570,10 @@ inline void rjson_serialize(
     write_member(w, "shadow_indexing", tps.shadow_indexing);
     write_member(w, "read_replica", tps.read_replica);
     write_member(w, "read_replica_bucket", tps.read_replica_bucket);
+    write_member(
+      w,
+      "remote_topic_namespace_override",
+      tps.remote_topic_namespace_override);
     write_member(w, "remote_topic_properties", tps.remote_topic_properties);
     write_member(w, "batch_max_bytes", tps.batch_max_bytes);
     write_member(
@@ -639,6 +640,10 @@ inline void read_value(json::Value const& rd, cluster::topic_properties& obj) {
     read_member(rd, "shadow_indexing", obj.shadow_indexing);
     read_member(rd, "read_replica", obj.read_replica);
     read_member(rd, "read_replica_bucket", obj.read_replica_bucket);
+    read_member(
+      rd,
+      "remote_topic_namespace_override",
+      obj.remote_topic_namespace_override);
     read_member(rd, "remote_topic_properties", obj.remote_topic_properties);
     read_member(rd, "batch_max_bytes", obj.batch_max_bytes);
     read_member(
@@ -699,6 +704,7 @@ inline void rjson_serialize(
     write_member(w, "tp_ns", cfg.tp_ns);
     write_member(w, "partition_count", cfg.partition_count);
     write_member(w, "replication_factor", cfg.replication_factor);
+    write_member(w, "is_migrated", cfg.is_migrated);
     write_member(w, "properties", cfg.properties);
     w.EndObject();
 }
@@ -708,6 +714,7 @@ read_value(json::Value const& rd, cluster::topic_configuration& cfg) {
     read_member(rd, "tp_ns", cfg.tp_ns);
     read_member(rd, "partition_count", cfg.partition_count);
     read_member(rd, "replication_factor", cfg.replication_factor);
+    read_member(rd, "is_migrated", cfg.is_migrated);
     read_member(rd, "properties", cfg.properties);
 }
 

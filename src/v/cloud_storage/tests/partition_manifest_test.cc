@@ -22,7 +22,6 @@
 #include "model/metadata.h"
 #include "model/timestamp.h"
 #include "random/generators.h"
-#include "serde/serde.h"
 #include "utils/tracking_allocator.h"
 
 #include <seastar/testing/test_case.hh>
@@ -35,7 +34,7 @@
 using namespace cloud_storage;
 
 namespace {
-const remote_path_provider path_provider(std::nullopt);
+const remote_path_provider path_provider(std::nullopt, std::nullopt);
 } // anonymous namespace
 
 static constexpr std::string_view empty_manifest_json = R"json({
@@ -313,7 +312,7 @@ manifest_for(std::vector<std::pair<model::offset, kafka::offset>> o) {
         cloud_storage::manifest_format::json,
         make_manifest_stream(empty_manifest_json))
       .get();
-    for (int i = 0; i < o.size() - 1; i++) {
+    for (size_t i = 0; i < o.size() - 1; i++) {
         segment_meta seg{
           .is_compacted = false,
           .size_bytes = 1024,
@@ -1013,7 +1012,7 @@ namespace cloud_storage {
 struct partition_manifest_accessor {
     static void add_replaced_segment(
       partition_manifest* m,
-      const segment_name& key,
+      const segment_name&,
       const partition_manifest::segment_meta& meta) {
         m->_replaced.push_back(
           partition_manifest::lw_segment_meta::convert(meta));
@@ -1538,6 +1537,8 @@ struct metadata_stm_segment
     cloud_storage::segment_name name;
     cloud_storage::partition_manifest::segment_meta meta;
 
+    auto serde_fields() { return std::tie(name, meta); }
+
     bool operator==(const metadata_stm_segment&) const = default;
 };
 
@@ -1554,6 +1555,17 @@ struct segment_meta_v0 {
     model::timestamp base_timestamp;
     model::timestamp max_timestamp;
     model::offset delta_offset;
+
+    auto serde_fields() {
+        return std::tie(
+          is_compacted,
+          size_bytes,
+          base_offset,
+          committed_offset,
+          base_timestamp,
+          max_timestamp,
+          delta_offset);
+    }
 
     auto operator<=>(const segment_meta_v0&) const = default;
 };
@@ -1573,6 +1585,19 @@ struct segment_meta_v1 {
     model::initial_revision_id ntp_revision;
     model::term_id archiver_term;
 
+    auto serde_fields() {
+        return std::tie(
+          is_compacted,
+          size_bytes,
+          base_offset,
+          committed_offset,
+          base_timestamp,
+          max_timestamp,
+          delta_offset,
+          ntp_revision,
+          archiver_term);
+    }
+
     auto operator<=>(const segment_meta_v1&) const = default;
 };
 
@@ -1584,6 +1609,8 @@ struct metadata_stm_segment
       serde::compat_version<0>> {
     cloud_storage::segment_name name;
     segment_meta_t meta;
+
+    auto serde_fields() { return std::tie(name, meta); }
 
     bool operator==(const metadata_stm_segment&) const = default;
 };

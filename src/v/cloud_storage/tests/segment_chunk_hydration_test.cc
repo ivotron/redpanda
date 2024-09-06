@@ -17,12 +17,14 @@
 #include "cloud_storage/tests/cloud_storage_fixture.h"
 #include "test_utils/async.h"
 #include "test_utils/scoped_config.h"
+#include "utils/lazy_abort_source.h"
+#include "utils/stream_provider.h"
 
 #include <seastar/util/defer.hh>
 
 inline ss::logger test_log("test"); // NOLINT
 namespace cloud_storage {
-remote_path_provider path_provider(std::nullopt);
+remote_path_provider path_provider(std::nullopt, std::nullopt);
 class remote_segment_test_helper {
 public:
     explicit remote_segment_test_helper(remote_segment& r)
@@ -43,12 +45,12 @@ namespace views = std::views;
 
 namespace {
 ss::abort_source never_abort;
-cloud_storage::lazy_abort_source always_continue([]() { return std::nullopt; });
+lazy_abort_source always_continue([]() { return std::nullopt; });
 
 remote::reset_input_stream make_reset_fn(const iobuf& segment_bytes) {
     return [&segment_bytes] {
         auto out = iobuf_deep_copy(segment_bytes);
-        return ss::make_ready_future<std::unique_ptr<storage::stream_provider>>(
+        return ss::make_ready_future<std::unique_ptr<stream_provider>>(
           std::make_unique<storage::segment_reader_handle>(
             make_iobuf_input_stream(std::move(out))));
     };

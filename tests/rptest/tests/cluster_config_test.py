@@ -685,6 +685,10 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 valid_value = random.choice(
                     [e for e in p['enum_values'] if e != initial_value])
 
+            if name == "tls_min_version":
+                valid_value = random.choice(
+                    [e for e in p['enum_values'] if e != initial_value])
+
             updates[name] = valid_value
 
         patch_result = self.admin.patch_cluster_config(upsert=updates,
@@ -1085,12 +1089,29 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
             strval: str
             yamlval: Any
 
+        class AliasedExample(NamedTuple):
+            key: str
+            alias: str
+            strval: str
+            yamlval: Any
+
         valid_examples = [
             Example("kafka_qdc_enable", "true", True),
             Example("append_chunk_size", "32768", 32768),
             Example("superusers", "['bob','alice']", ["bob", "alice"]),
             Example("storage_min_free_bytes", "1234567890", 1234567890),
             Example("kafka_memory_share_for_fetch", "0.6", 0.6)
+        ]
+
+        valid_aliased_examples = [
+            AliasedExample("data_transforms_per_core_memory_reservation",
+                           "wasm_per_core_memory_reservation", "123456789",
+                           123456789),
+            AliasedExample("cloud_storage_graceful_transfer_timeout_ms",
+                           "cloud_storage_graceful_transfer_timeout", "1024",
+                           1024),
+            AliasedExample("cloud_storage_max_segment_readers_per_shard",
+                           "cloud_storage_max_readers_per_shard", "128", 128)
         ]
 
         def yamlize(input) -> str:
@@ -1123,6 +1144,72 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
             self.logger.info(f"API readback for {e.key} '{api_readback}'")
             assert api_readback == e.yamlval
 
+        # Check that valid changes are accepted when config is set by key,
+        # and both alias and key are used for get.
+        for e in valid_aliased_examples:
+            self.logger.info(
+                f"Checking aliased {e.key}={e.alias}={e.strval} ({e.yamlval})")
+            self.rpk.cluster_config_set(e.key, e.strval)
+
+            # CLI readback should give same as we set
+            cli_readback_key = self.rpk.cluster_config_get(e.key)
+            cli_readback_alias = self.rpk.cluster_config_get(e.alias)
+
+            expect_cli_readback = yamlize(e.yamlval)
+
+            self.logger.info(
+                f"CLI readback for key '{cli_readback_key}', for alias '{cli_readback_alias}', expect '{expect_cli_readback}'"
+            )
+            assert cli_readback_key == cli_readback_alias == expect_cli_readback
+
+            # API readback should give properly structured+typed value
+            api_readback_key = self.admin.get_cluster_config(key=e.key)[e.key]
+            api_readback_alias = self.admin.get_cluster_config(
+                key=e.alias)[e.alias]
+            self.logger.info(
+                f"API readback for {e.key} '{api_readback_key}', for {e.alias} '{api_readback_alias}'"
+            )
+            assert api_readback_key == api_readback_alias == e.yamlval
+
+        #Reset valid_aliased_examples before we attempt to repeat tests by setting with alias.
+        valid_aliased_examples = [
+            AliasedExample("data_transforms_per_core_memory_reservation",
+                           "wasm_per_core_memory_reservation", "987654321",
+                           987654321),
+            AliasedExample("cloud_storage_graceful_transfer_timeout_ms",
+                           "cloud_storage_graceful_transfer_timeout", "4096",
+                           4096),
+            AliasedExample("cloud_storage_max_segment_readers_per_shard",
+                           "cloud_storage_max_readers_per_shard", "512", 512)
+        ]
+
+        # Check that valid changes are accepted when config is set by alias,
+        # and both alias and key are used for get.
+        for e in valid_aliased_examples:
+            self.logger.info(
+                f"Checking aliased {e.key}={e.alias}={e.strval} ({e.yamlval})")
+            self.rpk.cluster_config_set(e.alias, e.strval)
+
+            # CLI readback should give same as we set
+            cli_readback_key = self.rpk.cluster_config_get(e.key)
+            cli_readback_alias = self.rpk.cluster_config_get(e.alias)
+
+            expect_cli_readback = yamlize(e.yamlval)
+
+            self.logger.info(
+                f"CLI readback for key '{cli_readback_key}', for alias '{cli_readback_alias}', expect '{expect_cli_readback}'"
+            )
+            assert cli_readback_key == cli_readback_alias == expect_cli_readback
+
+            # API readback should give properly structured+typed value
+            api_readback_key = self.admin.get_cluster_config(key=e.key)[e.key]
+            api_readback_alias = self.admin.get_cluster_config(
+                key=e.alias)[e.alias]
+            self.logger.info(
+                f"API readback for {e.key} '{api_readback_key}', for {e.alias} '{api_readback_alias}'"
+            )
+            assert api_readback_key == api_readback_alias == e.yamlval
+
         # Check that the `set` command hits proper validation paths
         invalid_examples = [
             ("kafka_qdc_enable", "rhubarb"),
@@ -1138,6 +1225,21 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 self.logger.error(
                     f"Config setting {key}={strval} should have been rejected")
                 assert False
+
+        # Check that the `get` command hits proper validation paths
+        unknown_examples = [
+            "panda_size", "panda_retention_ms", "panda_mutation_rate"
+        ]
+
+        for key in unknown_examples:
+            with expect_exception(RpkException,
+                                  lambda e: "Unknown property" in str(e)):
+                self.rpk.cluster_config_get(key)
+
+        for key in unknown_examples:
+            with expect_exception(requests.exceptions.HTTPError,
+                                  lambda e: e.response.status_code == 400):
+                self.admin.get_cluster_config(key=key)
 
         # Check that resetting properties to their default via `set` works
         default_examples = [
@@ -1368,19 +1470,22 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 'cloud_storage_enabled': True,
                 'cloud_storage_credentials_source': 'aws_instance_metadata',
                 'cloud_storage_region': 'us-east-1',
-                'cloud_storage_bucket': 'dearliza'
+                'cloud_storage_bucket': 'dearliza',
+                'cloud_storage_url_style': 'virtual_host'
             },
             {
                 'cloud_storage_enabled': True,
                 'cloud_storage_credentials_source': 'gcp_instance_metadata',
                 'cloud_storage_region': 'us-east-1',
-                'cloud_storage_bucket': 'dearliza'
+                'cloud_storage_bucket': 'dearliza',
+                'cloud_storage_url_style': 'virtual_host'
             },
             {
                 'cloud_storage_enabled': True,
                 'cloud_storage_credentials_source': 'sts',
                 'cloud_storage_region': 'us-east-1',
-                'cloud_storage_bucket': 'dearliza'
+                'cloud_storage_bucket': 'dearliza',
+                'cloud_storage_url_style': 'virtual_host'
             },
             {
                 'cloud_storage_enabled': True,
@@ -1388,7 +1493,8 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 'cloud_storage_access_key': 'sesame',
                 'cloud_storage_credentials_source': 'config_file',
                 'cloud_storage_region': 'us-east-1',
-                'cloud_storage_bucket': 'dearliza'
+                'cloud_storage_bucket': 'dearliza',
+                'cloud_storage_url_style': 'virtual_host'
             },
         ]
         for payload in valid_updates:
@@ -1417,7 +1523,8 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
             'cloud_storage_secret_key': 'open',
             'cloud_storage_access_key': 'sesame',
             'cloud_storage_region': 'us-east-1',
-            'cloud_storage_bucket': 'dearliza'
+            'cloud_storage_bucket': 'dearliza',
+            'cloud_storage_url_style': 'virtual_host'
         }
         patch_result = self.admin.patch_cluster_config(upsert=static_config,
                                                        remove=[])
@@ -1995,6 +2102,22 @@ class ClusterConfigLegacyDefaultTest(RedpandaTest, ClusterConfigHelpersMixin):
 
             self.redpanda.start_node(node)
 
+        def all_versions_are_the_same():
+            admin = Admin(self.redpanda)
+            node_features = [
+                admin.get_features(n) for n in self.redpanda.nodes
+            ]
+
+            self.logger.info(
+                f"Current cluster versions: {[f['cluster_version']  for f in node_features]}"
+            )
+            return all(f['cluster_version'] == f['node_latest_version']
+                       for f in node_features)
+
+        wait_until(
+            all_versions_are_the_same, 30, 1,
+            "failed waiting for all brokers to report the same version")
+
     @cluster(num_nodes=3)
     @parametrize(wipe_cache=True)
     @parametrize(wipe_cache=False)
@@ -2003,7 +2126,9 @@ class ClusterConfigLegacyDefaultTest(RedpandaTest, ClusterConfigHelpersMixin):
         self.installer.install(self.redpanda.nodes, versions[0])
         self.redpanda.start()
         self._check_value_everywhere(self.key, self.legacy_default)
-
+        self.logger.info(
+            f"Executing upgrade tests starting with version: {versions[0]} and upgrading through: {versions[1:]}"
+        )
         for v in versions[1:]:
             self._upgrade(wipe_cache, v)
             self._check_value_everywhere(self.key, self.legacy_default)

@@ -9,7 +9,7 @@
 
 #include "cluster/partition_probe.h"
 
-#include "archival/archival_metadata_stm.h"
+#include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/partition.h"
 #include "config/configuration.h"
 #include "metrics/metrics.h"
@@ -221,7 +221,7 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
 
               try {
                   return _partition.log()->from_log_offset(log_offset);
-              } catch (std::runtime_error& e) {
+              } catch (const std::runtime_error& e) {
                   // Offset translation will throw if nothing was committed
                   // to the partition or if the offset is outside the
                   // translation range for any other reason.

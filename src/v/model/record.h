@@ -560,7 +560,9 @@ struct producer_identity
         return {pid.id, pid.epoch + producer_epoch(1)};
     }
 
-    bool has_exhausted_epoch() const { return epoch == producer_epoch::max(); }
+    bool has_exhausted_epoch() const {
+        return epoch >= (producer_epoch::max() - producer_epoch{1});
+    }
 
     auto operator<=>(const producer_identity&) const = default;
 
@@ -594,6 +596,11 @@ struct tx_range
 
     auto operator<=>(const tx_range&) const = default;
     friend std::ostream& operator<<(std::ostream&, const tx_range&);
+
+    template<typename H>
+    friend H AbslHashValue(H h, const tx_range& range) {
+        return H::combine(std::move(h), range.first, range.last, range.pid);
+    }
 };
 
 // Comparator that sorts in ascending order by first offset.

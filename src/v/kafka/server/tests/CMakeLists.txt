@@ -67,7 +67,8 @@ set(srcs
   produce_consume_test.cc
   group_metadata_serialization_test.cc
   partition_reassignments_test.cc
-  replicated_partition_test.cc)
+  replicated_partition_test.cc
+  metadata_test.cc)
 
 rp_test(
   FIXTURE_TEST
@@ -103,6 +104,20 @@ rp_test(
   LIBRARIES Seastar::seastar_perf_testing Boost::unit_test_framework v::application
   # the args below are just to keep it fast
   ARGS "-c 1 --duration=1 --runs=1 --memory=4G"
+  LABELS kafka
+)
+
+rp_test(
+  BENCHMARK_TEST
+  BINARY_NAME kafka_fetch
+  SOURCES fetch_bench.cc
+  LIBRARIES 
+    Seastar::seastar_perf_testing 
+    Boost::unit_test_framework 
+    v::application 
+    v::kafka_test_utils
+  # the args below are just to keep it fast
+  ARGS "-c 2 --duration=1 --runs=1 --memory=4G"
   LABELS kafka
 )
 

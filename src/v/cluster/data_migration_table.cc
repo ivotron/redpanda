@@ -16,8 +16,11 @@
 #include "cluster/errc.h"
 #include "cluster/logger.h"
 #include "cluster/topic_table.h"
+#include "container/fragmented_vector.h"
 
 #include <seastar/util/variant_utils.hh>
+
+#include <ranges>
 
 namespace cluster::data_migrations {
 
@@ -37,7 +40,9 @@ bool migrations_table::is_valid_state_transition(state current, state target) {
     case state::executing:
         return target == state::executed || target == state::canceling;
     case state::executed:
-        return target == state::finished || target == state::canceling;
+        return target == state::cut_over || target == state::canceling;
+    case state::cut_over:
+        return target == state::finished;
     case state::canceling:
         return target == state::cancelled;
     /**
@@ -117,6 +122,11 @@ migrations_table::get_migration(id id) const {
         return std::cref(it->second);
     }
     return {};
+}
+
+chunked_vector<id> migrations_table::get_migrations() const {
+    auto view = _migrations | std::views::keys;
+    return {view.begin(), view.end()};
 }
 
 migrations_table::notification_id

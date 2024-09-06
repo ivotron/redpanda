@@ -15,7 +15,6 @@
 #include "kafka/server/fwd.h"
 #include "kafka/server/handlers/handler_probe.h"
 #include "kafka/server/logger.h"
-#include "kafka/types.h"
 #include "net/connection.h"
 #include "net/server_probe.h"
 #include "security/acl.h"
@@ -63,6 +62,8 @@ public:
  * authz failures should be quiet or logged at a reduced severity level.
  */
 using authz_quiet = ss::bool_class<struct authz_quiet_tag>;
+
+using audit_authz_check = ss::bool_class<struct audit_authz_check_tag>;
 
 struct request_header;
 class request_context;

@@ -11,10 +11,12 @@
 
 #include "cloud_storage/inventory/ntp_hashes.h"
 
+#include "base/likely.h"
 #include "cloud_storage/logger.h"
 #include "container/fragmented_vector.h"
 #include "hashing/xx.h"
-#include "serde/serde.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/vector.h"
 #include "utils/directory_walker.h"
 
 #include <seastar/core/fstream.hh>
@@ -94,10 +96,9 @@ ss::future<> ntp_path_hashes::load_hashes(ss::input_stream<char>& stream) {
         vlog(_ctxlog.trace, "read {} path hashes from disk", hashes.size());
 
         for (auto hash : hashes) {
-            if (unlikely(_path_hashes.contains(hash))) {
+            auto [_, inserted] = _path_hashes.insert(hash);
+            if (unlikely(!inserted)) {
                 _possible_collisions.insert(hash);
-            } else {
-                _path_hashes.insert(hash);
             }
         }
     }

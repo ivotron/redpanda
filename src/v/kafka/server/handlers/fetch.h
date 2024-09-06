@@ -14,7 +14,6 @@
 #include "kafka/protocol/fetch.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
 #include "kafka/server/handlers/handler.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/ktp.h"
 #include "model/metadata.h"
@@ -427,6 +426,8 @@ read_result::memory_units_t reserve_memory_units(
   ssx::semaphore& memory_fetch_sem,
   const size_t max_bytes,
   const bool obligatory_batch_read);
+
+ss::future<> do_fetch(op_context& octx);
 
 } // namespace testing
 } // namespace kafka

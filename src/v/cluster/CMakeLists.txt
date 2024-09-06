@@ -107,6 +107,7 @@ v_cc_library(
   HDRS
     topic_recovery_validator.h
   SRCS
+    errors.cc
     metadata_cache.cc
     partition_manager.cc
     scheduling/partition_allocator.cc
@@ -144,7 +145,6 @@ v_cc_library(
     partition.cc
     partition_probe.cc
     id_allocator_stm.cc
-    tm_stm_cache.cc
     tm_stm.cc
     rm_stm.cc
     rm_stm_types.cc
@@ -209,21 +209,23 @@ v_cc_library(
     plugin_table.cc
     plugin_frontend.cc
     plugin_backend.cc
-    ../archival/archival_metadata_stm.cc
-    ../archival/archival_policy.cc
-    ../archival/ntp_archiver_service.cc
-    ../archival/probe.cc
-    ../archival/types.cc
-    ../archival/upload_controller.cc
-    ../archival/segment_reupload.cc
-    ../archival/retention_calculator.cc
-    ../archival/upload_housekeeping_service.cc
-    ../archival/adjacent_segment_merger.cc
-    ../archival/adjacent_segment_run.cc
-    ../archival/purger.cc
-    ../archival/scrubber.cc
-    ../archival/archiver_manager.cc
-    ../archival/async_data_uploader.cc
+    archival/archival_metadata_stm.cc
+    archival/archival_policy.cc
+    archival/ntp_archiver_service.cc
+    archival/probe.cc
+    archival/types.cc
+    archival/upload_controller.cc
+    archival/segment_reupload.cc
+    archival/retention_calculator.cc
+    archival/upload_housekeeping_service.cc
+    archival/adjacent_segment_merger.cc
+    archival/adjacent_segment_run.cc
+    archival/purger.cc
+    archival/scrubber.cc
+    archival/archiver_manager.cc
+    archival/async_data_uploader.cc
+    archival/archiver_operations_api.cc
+    archival/archiver_operations_impl.cc
     cloud_metadata/cluster_manifest.cc
     cloud_metadata/cluster_recovery_backend.cc
     cloud_metadata/key_utils.cc
@@ -246,6 +248,7 @@ v_cc_library(
     data_migration_irpc_frontend.cc
     data_migration_service_handler.cc
     data_migration_backend.cc
+    inventory_service.cc
   DEPS
     Seastar::seastar
     bootstrap_rpc
@@ -274,6 +277,7 @@ v_cc_library(
 add_subdirectory(tests)
 add_subdirectory(cloud_metadata/tests)
 add_subdirectory(self_test/tests)
+add_subdirectory(archival)
 
 # Separate library for recovery bits that may depend on Kafka subsystems.
 v_cc_library(

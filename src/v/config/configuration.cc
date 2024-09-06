@@ -314,10 +314,10 @@ configuration::configuration()
       *this,
       "topic_partitions_reserve_shard0",
       "Reserved partition slots on shard (CPU core) 0 on each node.  If this "
-      "is >= topic_partitions_per_core, no data partitions will be scheduled "
+      "is >= topic_partitions_per_shard, no data partitions will be scheduled "
       "on shard 0",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      2,
+      0,
       {
         .min = 0,     // It is not mandatory to reserve any capacity
         .max = 131072 // Same max as topic_partitions_per_shard
@@ -630,12 +630,7 @@ configuration::configuration()
       "Time to wait state catch up before rejecting a request",
       {.visibility = visibility::user},
       10s)
-  , find_coordinator_timeout_ms(
-      *this,
-      "find_coordinator_timeout_ms",
-      "Time to wait for a response from tx_registry",
-      {.visibility = visibility::user},
-      2000ms)
+  , find_coordinator_timeout_ms(*this, "find_coordinator_timeout_ms")
   , seq_table_min_size(*this, "seq_table_min_size")
   , tx_timeout_delay_ms(
       *this,
@@ -923,6 +918,15 @@ configuration::configuration()
       "How often look for the inactive transactions and abort them",
       {.visibility = visibility::tunable},
       10s)
+  , transaction_max_timeout_ms(
+      *this,
+      "transaction_max_timeout_ms",
+      "The maximum allowed timeout for transactions. If a client requested "
+      "transaction timeout exceeds this configuration, the broker will return "
+      "an error during transactional producer initialization. This guardrail "
+      "prevents hanging transactions from blocking consumer progress.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      15min)
   , tx_log_stats_interval_s(
       *this,
       "tx_log_stats_interval_s",
@@ -1109,7 +1113,8 @@ configuration::configuration()
   , raft_timeout_now_timeout_ms(
       *this,
       "raft_timeout_now_timeout_ms",
-      "Timeout for a timeout now request",
+      "Timeout for Raft's timeout_now RPC. This RPC is used to force a "
+      "follower to dispatch a round of votes immediately.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       1s)
   , raft_transfer_leader_recovery_timeout_ms(
@@ -2075,6 +2080,7 @@ configuration::configuration()
        model::cloud_storage_backend::google_s3_compat,
        model::cloud_storage_backend::azure,
        model::cloud_storage_backend::minio,
+       model::cloud_storage_backend::oracle_s3_compat,
        model::cloud_storage_backend::unknown})
   , cloud_storage_credentials_host(
       *this,
@@ -2216,12 +2222,13 @@ configuration::configuration()
   , cloud_storage_azure_hierarchical_namespace_enabled(
       *this,
       "cloud_storage_azure_hierarchical_namespace_enabled",
-      "Whether or not Azure Hierarchical Namespaces are enabled on the "
-      "cloud_storage_azure_storage_account. If this property is not set, "
-      "cloud_storage_azure_shared_key must be set, and each node will try to "
-      "determine at startup if HNS is enabled. Setting this property to True "
-      "will disable the check and assume HNS is active. Setting to False will "
-      "disable the check and assume that HNS is not active.",
+      "Force Redpanda to use or not use an \"Azure Data Lake Storage Gen2 "
+      "hierarchical namespace\" compliant client. When this property is not "
+      "set, each node infers at startup if HNS is enabled. When set to True, "
+      "this property disables the check and assumes HNS is enabled. When set "
+      "to False, this property disables the check and assumes HNS is not "
+      "enabled. This setting should be used only in emergencies where Redpanda "
+      "fails to detect the correct HNS status.",
       {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
       std::nullopt)
   , cloud_storage_upload_ctrl_update_interval_ms(
@@ -2436,10 +2443,11 @@ configuration::configuration()
       "over to the next trim operation. This parameter sets a limit on the "
       "memory occupied by objects that can be carried over from one trim to "
       "next, and allows cache to quickly unblock readers before starting the "
-      "directory inspection.",
-      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      "directory inspection (deprecated)",
+      {.needs_restart = needs_restart::no,
+       .visibility = visibility::deprecated},
       // This roughly translates to around 1000 carryover file names
-      256_KiB)
+      0_KiB)
   , cloud_storage_cache_check_interval_ms(
       *this,
       "cloud_storage_cache_check_interval",
@@ -2579,6 +2587,53 @@ configuration::configuration()
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       std::nullopt,
       {.min = 1.0, .max = 100.0})
+  , cloud_storage_inventory_based_scrub_enabled(
+      *this,
+      "cloud_storage_inventory_based_scrub_enabled",
+      "Scrubber uses the latest cloud storage inventory report, if available, "
+      "to check if the required objects exist in the bucket or container.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      false)
+  , cloud_storage_inventory_id(
+      *this,
+      "cloud_storage_inventory_id",
+      "The name of the scheduled inventory job created by Redpanda to generate "
+      "bucket or container inventory reports.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      "redpanda_scrubber_inventory")
+  , cloud_storage_inventory_reports_prefix(
+      *this,
+      "cloud_storage_inventory_reports_prefix",
+      "The prefix to the path in the cloud storage bucket or container where "
+      "inventory reports will be placed.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      "redpanda_scrubber_inventory")
+  , cloud_storage_inventory_self_managed_report_config(
+      *this,
+      "cloud_storage_inventory_self_managed_report_config",
+      "If enabled, Redpanda will not attempt to create the scheduled report "
+      "configuration using cloud storage APIs. The scrubbing process will "
+      "look for reports in the expected paths in the bucket or container, and "
+      "use the latest report found. Primarily intended for use in testing and "
+      "on backends where scheduled inventory reports are not supported.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      false)
+  , cloud_storage_inventory_report_check_interval_ms(
+      *this,
+      "cloud_storage_inventory_report_check_interval_ms",
+      "Time interval between checks for a new inventory report in the cloud "
+      "storage bucket or container.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      6h)
+  , cloud_storage_inventory_max_hash_size_during_parse(
+      *this,
+      "cloud_storage_inventory_max_hash_size_during_parse",
+      "Maximum bytes of hashes which will be held in memory before writing "
+      "data to disk during inventory report parsing. Affects the number of "
+      "files written by inventory service to disk during report parsing, as "
+      "when this limit is reached new files are written to disk.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      64_MiB)
   , superusers(
       *this,
       "superusers",
@@ -3150,6 +3205,12 @@ configuration::configuration()
       "Per-shard capacity of the cache for validating schema IDs.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       128)
+  , schema_registry_normalize_on_startup(
+      *this,
+      "schema_registry_normalize_on_startup",
+      "Normalize schemas as they are read from the topic on startup.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      false)
   , pp_sr_smp_max_non_local_requests(
       *this,
       "pp_sr_smp_max_non_local_requests",
@@ -3275,7 +3336,17 @@ configuration::configuration()
       "internal-only configuration and should be enabled only after consulting "
       "with Redpanda Support or engineers.",
       {.needs_restart = needs_restart::yes, .visibility = visibility::user},
-      false) {}
+      false)
+  , tls_min_version(
+      *this,
+      "tls_min_version",
+      "The minimum TLS version that Redpanda supports.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      tls_version::v1_2,
+      {tls_version::v1_0,
+       tls_version::v1_1,
+       tls_version::v1_2,
+       tls_version::v1_3}) {}
 
 configuration::error_map_t configuration::load(const YAML::Node& root_node) {
     if (!root_node["redpanda"]) {

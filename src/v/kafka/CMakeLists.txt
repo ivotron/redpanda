@@ -55,6 +55,7 @@ v_cc_library(
     server/group_recovery_consumer.cc
     server/group_metadata.cc
     server/group_tx_tracker_stm.cc
+    server/logger.cc
  DEPS
     Seastar::seastar
     v::bytes
@@ -71,6 +72,7 @@ v_cc_library(
 
 add_subdirectory(client)
 add_subdirectory(server/tests)
+add_subdirectory(utils)
 
 set_source_files_properties(
     server/group.cc # too big => negative impact on minimal rebuilds for unity

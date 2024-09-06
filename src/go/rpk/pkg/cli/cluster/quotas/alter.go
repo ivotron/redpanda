@@ -66,8 +66,7 @@ Add quota (consumer_byte_rate) to client ID starting with 'bar-':
     --name client-id-prefix=bar-
 
 Add quota (producer_byte_rate) to default client ID:
-  rpk cluster quotas alter --add producer_byte_rate=180000 \
-    --default client-id=foo
+  rpk cluster quotas alter --add producer_byte_rate=180000 --default client-id
 
 Remove quota (producer_byte_rate) from client ID 'foo':
   rpk cluster quotas alter --delete producer_byte_rate \
@@ -139,7 +138,7 @@ Remove quota (producer_byte_rate) from client ID 'foo':
 				})
 			}
 
-			request := []kadm.AlterClientQuotaEntry{{entity, operations}}
+			request := []kadm.AlterClientQuotaEntry{{Entity: entity, Ops: operations}}
 			var altered kadm.AlteredClientQuotas
 			if dry {
 				zap.L().Sugar().Debug("dry run: this result will not alter the client quotas")

@@ -20,6 +20,7 @@ from typing import Literal, Sequence, Optional, NewType, NamedTuple, Iterator
 from rptest.clients.offline_log_viewer import OfflineLogViewer
 import xxhash
 
+from botocore.exceptions import ClientError
 from rptest.archival.s3_client import ObjectMetadata, S3Client
 from rptest.archival.abs_client import ABSClient
 from rptest.clients.rp_storage_tool import RpStorageTool
@@ -621,7 +622,7 @@ def is_close_size(actual_size, expected_size):
     The actual size shouldn't be less than expected. Also, the difference
     between two values shouldn't be greater than the size of one segment.
     """
-    lower_bound = expected_size
+    lower_bound = int(expected_size * 0.95)
     upper_bound = expected_size + default_log_segment_size + \
                   int(default_log_segment_size * 0.2)
     return actual_size in range(lower_bound, upper_bound)
@@ -1049,7 +1050,15 @@ class BucketView:
                 self._state.segment_objects += 1
                 if self._scan_segments:
                     spc = parse_s3_segment_path(o.key)
-                    self._add_segment_metadata(o.key, spc)
+                    try:
+                        self._add_segment_metadata(o.key, spc)
+                    except ClientError as err:
+                        # The segment was listed by ListObjectV2 request
+                        # and deleted by Redpanda concurrently.
+                        # We don't expect this to happen with the manifests
+                        # so this error is only handled in case of segments
+                        if err['Error']['Code'] == 'NoSuchKey':
+                            self._state.ignored_objects += 1
             elif self.path_matcher.is_topic_manifest(o):
                 pass
             elif self.path_matcher.is_tx_manifest(o):

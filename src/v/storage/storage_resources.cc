@@ -11,10 +11,13 @@
 
 #include "storage_resources.h"
 
+#include "base/seastarx.h"
 #include "base/vlog.h"
 #include "config/configuration.h"
 #include "storage/chunk_cache.h"
 #include "storage/logger.h"
+
+#include <seastar/core/smp.hh>
 
 namespace {
 uint64_t per_shard_target_replay_bytes(uint64_t global_target_replay_bytes) {
@@ -161,7 +164,7 @@ size_t storage_resources::calc_falloc_step() {
     }
 
     vlog(
-      stlog.debug,
+      rslog.debug,
       "calc_falloc_step: step {} (max {})",
       step,
       _segment_fallocation_step());
@@ -193,7 +196,7 @@ storage_resources::get_falloc_step(std::optional<uint64_t> segment_size_hint) {
 bool storage_resources::offset_translator_take_bytes(
   int32_t bytes, ssx::semaphore_units& units) {
     vlog(
-      stlog.trace,
+      rslog.trace,
       "offset_translator_take_bytes {} += {} (current {})",
       units.count(),
       bytes,
@@ -206,7 +209,7 @@ bool storage_resources::offset_translator_take_bytes(
 bool storage_resources::configuration_manager_take_bytes(
   size_t bytes, ssx::semaphore_units& units) {
     vlog(
-      stlog.trace,
+      rslog.trace,
       "configuration_manager_take_bytes {} += {} (current {})",
       units.count(),
       bytes,
@@ -219,7 +222,7 @@ bool storage_resources::configuration_manager_take_bytes(
 bool storage_resources::stm_take_bytes(
   size_t bytes, ssx::semaphore_units& units) {
     vlog(
-      stlog.trace,
+      rslog.trace,
       "stm_take_bytes {} += {} (current {})",
       units.count(),
       bytes,
@@ -243,7 +246,7 @@ bool storage_resources::filter_checkpoints(
 adjustable_semaphore::take_result
 storage_resources::compaction_index_take_bytes(size_t bytes) {
     vlog(
-      stlog.trace,
+      rslog.trace,
       "compaction_index_take_bytes {} (current {})",
       bytes,
       _compaction_index_bytes.current());

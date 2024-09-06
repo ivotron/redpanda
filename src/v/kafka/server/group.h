@@ -18,12 +18,11 @@
 #include "container/chunked_hash_map.h"
 #include "container/fragmented_vector.h"
 #include "features/feature_table.h"
-#include "kafka/group_probe.h"
 #include "kafka/protocol/fwd.h"
 #include "kafka/protocol/offset_commit.h"
 #include "kafka/server/group_metadata.h"
+#include "kafka/server/group_probe.h"
 #include "kafka/server/member.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/timestamp.h"
@@ -49,6 +48,9 @@ struct configuration;
 }
 
 namespace kafka {
+
+using assignments_type = std::unordered_map<member_id, bytes>;
+
 struct group_log_group_metadata;
 
 /**
@@ -107,6 +109,7 @@ using enable_group_metrics = ss::bool_class<struct enable_gr_metrics_tag>;
 std::ostream& operator<<(std::ostream&, group_state gs);
 
 ss::sstring group_state_to_kafka_name(group_state);
+std::optional<group_state> group_state_from_kafka_name(std::string_view);
 cluster::begin_group_tx_reply make_begin_tx_reply(cluster::tx::errc);
 cluster::commit_group_tx_reply make_commit_tx_reply(cluster::tx::errc);
 cluster::abort_group_tx_reply make_abort_tx_reply(cluster::tx::errc);
@@ -894,6 +897,8 @@ private:
         return _feature_table.local().is_active(
           features::feature::group_tx_fence_dedicated_batch_type);
     }
+
+    cluster::tx::errc map_tx_replication_error(std::error_code ec);
 
     kafka::group_id _id;
     group_state _state;

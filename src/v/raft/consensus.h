@@ -113,11 +113,12 @@ public:
       keep_snapshotted_log = keep_snapshotted_log::no);
 
     /// Initial call. Allow for internal state recovery
-    ss::future<>
-      start(std::optional<state_machine_manager_builder> = std::nullopt);
+    ss::future<> start(
+      std::optional<state_machine_manager_builder> = std::nullopt,
+      std::optional<xshard_transfer_state> = std::nullopt);
 
     /// Stop all communications.
-    ss::future<> stop();
+    ss::future<xshard_transfer_state> stop();
 
     /// Stop consensus instance from accepting requests
     void shutdown_input();
@@ -557,7 +558,7 @@ private:
     do_append_entries(append_entries_request&&);
     ss::future<install_snapshot_reply>
     do_install_snapshot(install_snapshot_request r);
-    ss::future<> do_start();
+    ss::future<> do_start(std::optional<xshard_transfer_state>);
 
     ss::future<result<replicate_result>> dispatch_replicate(
       append_entries_request,
@@ -824,7 +825,7 @@ private:
     bool _transferring_leadership{false};
 
     /// useful for when we are not the leader
-    clock_type::time_point _hbeat = clock_type::now();
+    clock_type::time_point _hbeat = clock_type::now(); // is max() iff leader
     clock_type::time_point _became_leader_at = clock_type::now();
     clock_type::time_point _instantiated_at = clock_type::now();
 
@@ -845,15 +846,22 @@ private:
     /// used to wait for background ops before shutting down
     ss::gate _bg;
 
+    /**
+     * Locks listed in the order of nestedness, election being the outermost
+     * and snapshot the innermost. I.e. if any of these locks are used at the
+     * same time, they should be acquired in the listed order and released in
+     * reverse order.
+     */
+    /// guards from concurrent election where this instance is a candidate
+    mutex _election_lock{"consensus::election_lock"};
     /// all raft operations must happen exclusively since the common case
     /// is for the operation to touch the disk
     mutex _op_lock{"consensus::op_lock"};
     /// since snapshot state is orthogonal to raft state when writing snapshot
     /// it is enough to grab the snapshot mutex, there is no need to keep
-    /// oplock, if the two locks are expected to be acquired at the same time
-    /// the snapshot lock should always be an internal (taken after the
-    /// _op_lock)
+    /// oplock
     mutex _snapshot_lock{"consensus::snapshot_lock"};
+
     /// used for notifying when commits happened to log
     event_manager _event_manager;
     std::unique_ptr<probe> _probe;

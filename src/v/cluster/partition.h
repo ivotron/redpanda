@@ -11,9 +11,9 @@
 
 #pragma once
 
-#include "archival/archival_metadata_stm.h"
-#include "archival/fwd.h"
 #include "cloud_storage/fwd.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/fwd.h"
 #include "cluster/fwd.h"
 #include "cluster/partition_probe.h"
 #include "cluster/types.h"
@@ -21,6 +21,7 @@
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
 #include "raft/replicate.h"
+#include "storage/ntp_config.h"
 #include "storage/translating_reader.h"
 #include "storage/types.h"
 
@@ -28,6 +29,14 @@
 
 namespace cluster {
 class partition_manager;
+
+// A struct holding in-memory state that can make starting the partition
+// instance on the destination shard of the x-shard transfer easier. Note that
+// it is strictly an optimization, as the partition must always be able to
+// perform a "cold start" from persistent state only.
+struct xshard_transfer_state {
+    raft::xshard_transfer_state raft;
+};
 
 /// holds cluster logic that is not raft related
 /// all raft logic is proxied transparently
@@ -46,7 +55,8 @@ public:
     ~partition() = default;
 
     raft::group_id group() const;
-    ss::future<> start(state_machine_registry&);
+    ss::future<>
+    start(state_machine_registry&, const std::optional<xshard_transfer_state>&);
     ss::future<> stop();
 
     /// This method exposes reset mutex for the external subsystem
@@ -347,6 +357,11 @@ private:
     ss::future<std::optional<storage::timequery_result>>
     local_timequery(storage::timequery_config, bool allow_cloud_fallback);
 
+    // Restarts the archiver
+    // If should_notify_topic_config is set, it marks the topic_manifest as
+    // dirty so that it gets reuploaded
+    ss::future<> restart_archiver(bool should_notify_topic_config);
+
     consensus_ptr _raft;
     ss::shared_ptr<cluster::log_eviction_stm> _log_eviction_stm;
     ss::shared_ptr<cluster::rm_stm> _rm_stm;
@@ -376,6 +391,11 @@ private:
     std::unique_ptr<cluster::topic_configuration> _topic_cfg;
 
     ss::sharded<archival::upload_housekeeping_service>& _upload_housekeeping;
+    config::binding<model::cleanup_policy_bitflags> _log_cleanup_policy;
+
+    // Used in `sync_kafka_start_offset_override` to avoid having to re-sync the
+    // `archival_meta_stm`.
+    bool _has_synced_archival_for_start_override{false};
 
     friend std::ostream& operator<<(std::ostream& o, const partition& x);
 };

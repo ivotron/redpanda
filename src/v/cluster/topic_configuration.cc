@@ -11,6 +11,7 @@
 
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "model/namespace.h"
 #include "reflection/adl.h"
 #include "storage/ntp_config.h"
 
@@ -36,7 +37,8 @@ storage::ntp_config topic_configuration::make_ntp_config(
             .retention_time = properties.retention_duration,
             // we disable cache for internal topics as they are read only once
             // during bootstrap.
-            .cache_enabled = storage::with_cache(!is_internal()),
+            .cache_enabled = storage::with_cache(
+              !is_internal() || tp_ns.tp == model::tx_manager_topic),
             .recovery_enabled = storage::topic_recovery_enabled(
               properties.recovery ? *properties.recovery : false),
             .shadow_indexing_mode = properties.shadow_indexing,
@@ -66,12 +68,12 @@ storage::ntp_config topic_configuration::make_ntp_config(
 std::ostream& operator<<(std::ostream& o, const topic_configuration& cfg) {
     fmt::print(
       o,
-      "{{ topic: {}, partition_count: {}, replication_factor: {}, "
-      "properties: "
-      "{}}}",
+      "{{ topic: {}, partition_count: {}, replication_factor: {}, is_migrated: "
+      "{}, properties: {}}}",
       cfg.tp_ns,
       cfg.partition_count,
       cfg.replication_factor,
+      cfg.is_migrated,
       cfg.properties);
 
     return o;
@@ -103,8 +105,8 @@ void adl<cluster::topic_configuration>::to(
       t.properties.shadow_indexing);
 }
 
-// note: adl deserialization doesn't support read replica fields since serde
-// should be used for new versions.
+// note: adl deserialization doesn't support read replica or migration fields
+// since serde should be used for new versions.
 cluster::topic_configuration
 adl<cluster::topic_configuration>::from(iobuf_parser& in) {
     // NOTE: The first field of the topic_configuration is a

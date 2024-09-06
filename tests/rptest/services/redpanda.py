@@ -6,6 +6,7 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
+import subprocess
 from abc import ABC, abstractmethod
 import concurrent.futures
 import copy
@@ -69,12 +70,22 @@ from rptest.services.storage_failure_injection import FailureInjectionConfig
 from rptest.services.utils import NodeCrash, LogSearchLocal, LogSearchCloud, Stopwatch
 from rptest.util import inject_remote_script, ssh_output_stderr, wait_until_result
 from rptest.utils.allow_logs_on_predicate import AllowLogsOnPredicate
+import enum
 
 Partition = collections.namedtuple('Partition',
                                    ['topic', 'index', 'leader', 'replicas'])
 
 MetricSample = collections.namedtuple(
     'MetricSample', ['family', 'sample', 'node', 'value', 'labels'])
+
+
+class CloudStorageCleanupStrategy(enum.Enum):
+    # I.e. if we are using a lifecycle rule, then we do NOT clean the bucket
+    IF_NOT_USING_LIFECYCLE_RULE = "IF_NOT_USING_LIFECYCLE_RULE"
+
+    # Ignore large buckets (based on number of objects). For small buckets, ALWAYS clean.
+    ALWAYS_SMALL_BUCKETS_ONLY = "ALWAYS_SMALL_BUCKETS_ONLY"
+
 
 SaslCredentials = redpanda_types.SaslCredentials
 
@@ -138,6 +149,10 @@ CHAOS_LOG_ALLOW_LIST = [
     re.compile(
         "cluster - .*exception while executing partition operation:.*std::exception \(std::exception\)"
     ),
+    # Failure to handle an internal RPC because the RPC server already handles connections but doesn't yet handle this method. This can happen while the node is still starting up/restarting.
+    # e.g. "admin_api_server - server.cc:655 - [_anonymous] exception intercepted - url: [http://ip-172-31-9-208:9644/v1/brokers/7/decommission] http_return_status[500] reason - seastar::httpd::server_error_exception (Unexpected error: rpc::errc::method_not_found)"
+    re.compile(
+        "admin_api_server - .*Unexpected error: rpc::errc::method_not_found")
 ]
 
 # Log errors emitted by refresh credentials system when cloud storage is enabled with IAM roles
@@ -470,6 +485,10 @@ class SISettings:
 
     GLOBAL_ABS_STORAGE_ACCOUNT = "abs_storage_account"
     GLOBAL_ABS_SHARED_KEY = "abs_shared_key"
+    GLOBAL_AZURE_CLIENT_ID = "azure_client_id"
+    GLOBAL_AZURE_CLIENT_SECRET = "azure_client_secret"
+    GLOBAL_AZURE_TENANT_ID = "azure_tenant_id"
+
     GLOBAL_CLOUD_PROVIDER = "cloud_provider"
 
     # The account and key to use with local Azurite testing.
@@ -487,7 +506,7 @@ class SISettings:
                  cloud_storage_access_key: str = 'panda-user',
                  cloud_storage_secret_key: str = 'panda-secret',
                  cloud_storage_region: str = 'panda-region',
-                 cloud_storage_api_endpoint: str = 'minio-s3',
+                 cloud_storage_api_endpoint: Optional[str] = None,
                  cloud_storage_api_endpoint_port: int = 9000,
                  cloud_storage_url_style: str = 'virtual_host',
                  cloud_storage_cache_size: Optional[int] = None,
@@ -532,6 +551,10 @@ class SISettings:
                     CloudStorageType, test_context.
                     injected_args['cloud_storage_type_and_url_style'][0])
 
+        # For most cloud storage backends, we clean up small buckets always.
+        # In some cases, we will modify this strategy in the block below.
+        self.cloud_storage_cleanup_strategy = CloudStorageCleanupStrategy.ALWAYS_SMALL_BUCKETS_ONLY
+
         if self.cloud_storage_type == CloudStorageType.S3:
             self.cloud_storage_credentials_source = cloud_storage_credentials_source
             self.cloud_storage_access_key = cloud_storage_access_key
@@ -539,11 +562,21 @@ class SISettings:
             self.cloud_storage_region = cloud_storage_region
             self._cloud_storage_bucket = f'panda-bucket-{uuid.uuid1()}'
             self.cloud_storage_url_style = cloud_storage_url_style
+            self.has_cloud_storage_api_endpoint_override = False
 
-            self.cloud_storage_api_endpoint = cloud_storage_api_endpoint
-            if test_context.globals.get(self.GLOBAL_CLOUD_PROVIDER,
-                                        'aws') == 'gcp':
+            if cloud_storage_api_endpoint is not None:
+                self.has_cloud_storage_api_endpoint_override = True
+                self.cloud_storage_api_endpoint = cloud_storage_api_endpoint
+            elif test_context.globals.get(self.GLOBAL_CLOUD_PROVIDER,
+                                          'aws') == 'gcp':
                 self.cloud_storage_api_endpoint = 'storage.googleapis.com'
+                # For GCP, we currently use S3 compat API over boto3, which does not support batch deletes
+                # This makes cleanup slow, even for small-ish buckets.
+                # Therefore, we maintain logic of skipping bucket cleaning completely, if we are using lifecycle rule.
+                self.cloud_storage_cleanup_strategy = CloudStorageCleanupStrategy.IF_NOT_USING_LIFECYCLE_RULE
+            else:
+                # Endpoint defaults to minio-s3
+                self.cloud_storage_api_endpoint = 'minio-s3'
             self.cloud_storage_api_endpoint_port = cloud_storage_api_endpoint_port
 
             if hasattr(test_context, 'injected_args') \
@@ -579,6 +612,7 @@ class SISettings:
         self.endpoint_url = f'http://{self.cloud_storage_api_endpoint}:{self.cloud_storage_api_endpoint_port}'
         self.bypass_bucket_creation = bypass_bucket_creation
         self.use_bucket_cleanup_policy = use_bucket_cleanup_policy
+
         self.cloud_storage_housekeeping_interval_ms = cloud_storage_housekeeping_interval_ms
         self.cloud_storage_spillover_manifest_max_segments = cloud_storage_spillover_manifest_max_segments
         self.retention_local_strict = retention_local_strict
@@ -653,6 +687,11 @@ class SISettings:
         Update based on the test context, to e.g. consume AWS access keys in
         the globals dictionary.
         """
+        if self.has_cloud_storage_api_endpoint_override:
+            logger.info(
+                "cloud_storage_api_endpoint is overridden, skipping loading global test_context options in _load_s3_context."
+            )
+            return
         cloud_storage_credentials_source = test_context.globals.get(
             self.GLOBAL_CLOUD_STORAGE_CRED_SOURCE_KEY, 'config_file')
         cloud_storage_access_key = test_context.globals.get(
@@ -1663,14 +1702,29 @@ class RedpandaServiceCloud(KubeServiceMixin, RedpandaServiceABC):
         # later to dataclass
         self._cc_config = context.globals[self.GLOBAL_CLOUD_CLUSTER_CONFIG]
 
-        self._provider_config = {
-            "access_key":
-            context.globals.get(SISettings.GLOBAL_S3_ACCESS_KEY, None),
-            "secret_key":
-            context.globals.get(SISettings.GLOBAL_S3_SECRET_KEY, None),
-            "region":
-            context.globals.get(SISettings.GLOBAL_S3_REGION_KEY, None)
-        }
+        self._provider_config = {}
+        match get_cloud_provider():
+            case "aws" | "gcp":
+                self._provider_config.update({
+                    'access_key':
+                        context.globals.get(SISettings.GLOBAL_S3_ACCESS_KEY, None),
+                    'secret_key':
+                        context.globals.get(SISettings.GLOBAL_S3_SECRET_KEY, None),
+                    'region':
+                        context.globals.get(SISettings.GLOBAL_S3_REGION_KEY, None)
+                }) # yapf: disable
+            case "azure":
+                self._provider_config.update({
+                    'azure_client_id':
+                        context.globals.get(SISettings.GLOBAL_AZURE_CLIENT_ID, None),
+                    'azure_client_secret':
+                        context.globals.get(SISettings.GLOBAL_AZURE_CLIENT_SECRET, None),
+                    'azure_tenant_id':
+                        context.globals.get(SISettings.GLOBAL_AZURE_TENANT_ID, None)
+                }) # yapf: disable
+            case _:
+                pass
+
         # log cloud cluster id
         self.logger.debug(f"initial cluster_id: {self._cc_config['id']}")
 
@@ -1698,7 +1752,7 @@ class RedpandaServiceCloud(KubeServiceMixin, RedpandaServiceABC):
             self,
             remote_uri=remote_uri,
             cluster_id=cluster_id,
-            cluster_privider=self._cloud_cluster.config.provider,
+            cluster_provider=self._cloud_cluster.config.provider,
             cluster_region=self._cloud_cluster.config.region,
             tp_proxy=self._cloud_cluster.config.teleport_auth_server,
             tp_token=self._cloud_cluster.config.teleport_bot_token)
@@ -1788,6 +1842,14 @@ class RedpandaServiceCloud(KubeServiceMixin, RedpandaServiceABC):
 
         return active_rp_pods, inactive_rp_pods, unknown_rp_pods
 
+    def get_redpanda_statefulset(self):
+        """Get the statefulset for redpanda brokers"""
+        if not self.__is_operator_v2_cluster():
+            return None
+        return json.loads(
+            self.kubectl.cmd(
+                'get statefulset -n redpanda redpanda-broker -o json'))
+
     def get_redpanda_pods(self):
         """Get the current list of redpanda pods as k8s API objects."""
         pods = json.loads(self.kubectl.cmd('get pods -n redpanda -o json'))
@@ -1856,6 +1918,17 @@ class RedpandaServiceCloud(KubeServiceMixin, RedpandaServiceABC):
         # Call to rebuild metadata for all cloud brokers
         self.rebuild_pods_classes()
 
+    def __is_operator_v2_cluster(self):
+        # Even when nothing is found, kubectl always exits 0.  Ref: https://github.com/kubernetes/kubectl/issues/821
+        # But when nothing is found, kubectl by default prints "No resources found in redpanda namespace." to stderr.
+        # Which gets merged into the result lines!
+        #
+        # So, we add --ignore-not-found.  This flag skips the human-readable "No resource" message.
+        # By the way, exit code is still 0, even with this flag :)
+        return len(
+            self.kubectl.cmd(
+                ['get', 'redpanda', '-n=redpanda', '--ignore-not-found'])) > 0
+
     def rolling_restart_pods(self, pod_timeout: int = 180):
         """Restart all pods in the cluster one at a time.
 
@@ -1863,22 +1936,16 @@ class RedpandaServiceCloud(KubeServiceMixin, RedpandaServiceABC):
         until the previous one has finished.
         Block until cluster is ready after all restarts are finished.
 
-        :param timeout: seconds to wait for each pod to be ready after restart
+        :param pod_timeout: seconds to wait for each pod to be ready after restart
         """
 
-        cluster_name = f'rp-{self._cloud_cluster.cluster_id}'
         pod_names = [p.name for p in self.pods]
         self.logger.info(f'rolling restart on pods: {pod_names}')
 
         for pod_name in pod_names:
             self.restart_pod(pod_name, pod_timeout)
-            # kubectl get cluster rp-clo88krkqkrfamptsst0 -n=redpanda -o=jsonpath='{.status.replicas}'
-            expected_replicas = int(
-                self.kubectl.cmd([
-                    'get', 'cluster', cluster_name, '-n=redpanda',
-                    "-o=jsonpath='{.status.replicas}'"
-                ]))
-
+            cluster_name = f'rp-{self._cloud_cluster.cluster_id}'
+            expected_replicas = self.cluster_desired_replicas(cluster_name)
             # Check cluster readiness after pod restart
             self.check_cluster_readiness(cluster_name, expected_replicas,
                                          pod_timeout)
@@ -1937,8 +2004,23 @@ class RedpandaServiceCloud(KubeServiceMixin, RedpandaServiceABC):
             f"Cluster {cluster_name} arrived at readyReplicas {expected_replicas}"
         )
 
-    def cluster_ready_replicas(self, cluster_name: str):
+    def cluster_desired_replicas(self, cluster_name: str = ''):
+        """Return cluster desired replica count."""
+        if self.__is_operator_v2_cluster():
+            rp_statefulset = self.get_redpanda_statefulset()
+            return int(rp_statefulset['status']['replicas'])
+        expected_replicas = int(
+            self.kubectl.cmd([
+                'get', 'cluster', cluster_name, '-n=redpanda',
+                "-o=jsonpath='{.status.replicas}'"
+            ]))
+        return expected_replicas
+
+    def cluster_ready_replicas(self, cluster_name: str = ''):
         """Retrieves the number of ready replicas for the given cluster."""
+        if self.__is_operator_v2_cluster():
+            rp_statefulset = self.get_redpanda_statefulset()
+            return int(rp_statefulset['status']['readyReplicas'])
         ret = self.kubectl.cmd([
             'get', 'cluster', cluster_name, '-n=redpanda',
             "-o=jsonpath='{.status.readyReplicas}'"
@@ -2408,11 +2490,13 @@ class RedpandaService(RedpandaServiceBase):
                     self.LOG_LEVEL_KEY, self.DEFAULT_LOG_LEVEL)
             else:
                 self._log_level = log_level
-            self._log_config = LoggingConfig(self._log_level, {
-                'exception': 'debug',
-                'io': 'debug',
-                'seastar_memory': 'debug'
-            })
+            self._log_config = LoggingConfig(
+                self._log_level, {
+                    'exception': 'debug',
+                    'io': 'debug',
+                    'seastar_memory': 'debug',
+                    'dns_resolver': 'info'
+                })
 
         self._started: Set[ClusterNode] = set()
 
@@ -3005,7 +3089,8 @@ class RedpandaService(RedpandaServiceBase):
                    expect_fail: bool = False,
                    auto_assign_node_id: bool = False,
                    omit_seeds_on_idx_one: bool = True,
-                   skip_readiness_check: bool = False):
+                   skip_readiness_check: bool = False,
+                   node_id_override: int | None = None):
         """
         Start a single instance of redpanda. This function will not return until
         redpanda appears to have started successfully. If redpanda does not
@@ -3022,7 +3107,8 @@ class RedpandaService(RedpandaServiceBase):
                 node,
                 override_cfg_params,
                 auto_assign_node_id=auto_assign_node_id,
-                omit_seeds_on_idx_one=omit_seeds_on_idx_one)
+                omit_seeds_on_idx_one=omit_seeds_on_idx_one,
+                node_id_override=node_id_override)
 
         if timeout is None:
             timeout = self.node_ready_timeout_s
@@ -3121,14 +3207,40 @@ class RedpandaService(RedpandaServiceBase):
     def _log_node_process_state(self, node):
         """
         For debugging issues around starting and stopping processes: log
-        which processes are running and which ports are in use.
+        which processes are running and which ports are in use. Additionally,
+        capture detailed memory usage for the top 3 memory-consuming processes.
         """
 
-        for line in node.account.ssh_capture("ps aux", timeout_sec=30):
+        self.logger.debug(
+            f"Gathering process and port usage information on {node.name}...")
+
+        # Capture general process information
+        process_lines = []
+        for line in node.account.ssh_capture("ps aux --sort=-%mem",
+                                             timeout_sec=30):
+            process_lines.append(line.strip())
             self.logger.debug(line.strip())
+
+        # Capture network information
         for line in node.account.ssh_capture("netstat -panelot",
                                              timeout_sec=30):
             self.logger.debug(line.strip())
+
+        # Analyze memory usage in detail for the top 3 processes
+        self.logger.debug(
+            "Gathering detailed memory usage for the top 3 memory-consuming processes..."
+        )
+        for process_line in process_lines[
+                1:4]:  # Skip header, get top 3 processes
+            fields = process_line.split()
+            pid = fields[1]
+            mem_usage = fields[3]
+            self.logger.debug(
+                f"Process PID: {pid}, Memory Usage: {mem_usage}%")
+            self.logger.debug(f"Memory map for PID {pid}:")
+            for pmap_line in node.account.ssh_capture(f"pmap {pid}",
+                                                      timeout_sec=30):
+                self.logger.debug(pmap_line.strip())
 
     def start_service(self, node, start):
         # Maybe the service collides with something that wasn't cleaned up
@@ -3197,24 +3309,64 @@ class RedpandaService(RedpandaServiceBase):
 
     @property
     def cloud_storage_client(self):
-        assert self._cloud_storage_client, 'cloud storage client not available - did you call si_start()?'
+        assert self._cloud_storage_client, 'cloud storage client not available - did you call start_si()?'
         return self._cloud_storage_client
 
     def delete_bucket_from_si(self):
-        if self.si_settings.use_bucket_cleanup_policy:
+        self.logger.info(
+            f"cloud_storage_cleanup_strategy = {self.si_settings.cloud_storage_cleanup_strategy}"
+        )
+
+        if self.si_settings.cloud_storage_cleanup_strategy == CloudStorageCleanupStrategy.ALWAYS_SMALL_BUCKETS_ONLY:
+            bucket_is_small = True
+            max_object_count = 3000
+
+            # See if the bucket is small enough
+            t = time.time()
+            for i, m in enumerate(
+                    self.cloud_storage_client.list_objects(
+                        self.si_settings.cloud_storage_bucket)):
+                if i >= max_object_count:
+                    bucket_is_small = False
+                    break
             self.logger.info(
-                f"Skipping deletion of bucket/container: {self.si_settings.cloud_storage_bucket}."
-                "Using a cleanup policy instead. Please delete it manually")
-            return
+                f"Determining bucket count for {self.si_settings.cloud_storage_bucket} up to {max_object_count} objects took {time.time() - t}s"
+            )
+            if bucket_is_small:
+                # Log grep hint: "a small bucket"
+                self.logger.info(
+                    f"Bucket {self.si_settings.cloud_storage_bucket} is a small bucket (deleting it)"
+                )
+            else:
+                self.logger.info(
+                    f"Bucket {self.si_settings.cloud_storage_bucket} is NOT a small bucket (NOT deleting it)"
+                )
+                return
+
+        elif self.si_settings.cloud_storage_cleanup_strategy == CloudStorageCleanupStrategy.IF_NOT_USING_LIFECYCLE_RULE:
+            if self.si_settings.use_bucket_cleanup_policy:
+                self.logger.info(
+                    f"Skipping deletion of bucket/container: {self.si_settings.cloud_storage_bucket}. "
+                    "Using a cleanup policy instead.")
+                return
+        else:
+            raise ValueError(
+                f"Unimplemented cloud storage cleanup strategy {self.si_settings.cloud_storage_cleanup_strategy}"
+            )
 
         self.logger.debug(
             f"Deleting bucket/container: {self.si_settings.cloud_storage_bucket}"
         )
 
         assert self.si_settings.cloud_storage_bucket, f"missing bucket : {self.si_settings.cloud_storage_bucket}"
+        t = time.time()
         self.cloud_storage_client.empty_and_delete_bucket(
             self.si_settings.cloud_storage_bucket,
             parallel=self.dedicated_nodes)
+
+        self.logger.info(
+            f"Emptying and deleting bucket {self.si_settings.cloud_storage_bucket} took {time.time() - t}s"
+        )
 
     def get_objects_from_si(self):
         assert self.cloud_storage_client and self._si_settings and self._si_settings.cloud_storage_bucket, \
@@ -3323,11 +3475,32 @@ class RedpandaService(RedpandaServiceBase):
             raise AssertionError(
                 "Nodes report restart required but expect_restart is False")
 
-    def set_feature_active(self, feature_name: str, active: bool, *,
-                           timeout_sec: int):
-        state = 'active' if active else 'disabled'
-        self._admin.put_feature(feature_name, {"state": state})
-        self.await_feature(feature_name, state, timeout_sec=timeout_sec)
+    def set_feature_active(self,
+                           feature_name: str,
+                           active: bool,
+                           *,
+                           timeout_sec: int = 15):
+        target_state = 'active' if active else 'disabled'
+        cur_state = self.get_feature_state(feature_name)
+        if active and cur_state == 'unavailable':
+            # If we have just restarted after an upgrade, wait for cluster version
+            # to progress and for the feature to become available.
+            self.await_feature(feature_name,
+                               'available',
+                               timeout_sec=timeout_sec)
+        self._admin.put_feature(feature_name, {"state": target_state})
+        self.await_feature(feature_name, target_state, timeout_sec=timeout_sec)
+
+    def get_feature_state(self,
+                          feature_name: str,
+                          node: ClusterNode | None = None):
+        f = self._admin.get_features(node=node)
+        by_name = dict((f['name'], f) for f in f['features'])
+        try:
+            state = by_name[feature_name]['state']
+        except KeyError:
+            state = None
+        return state
 
     def await_feature(self,
                       feature_name: str,
@@ -3344,13 +3517,7 @@ class RedpandaService(RedpandaServiceBase):
 
         def is_awaited_state():
             for n in nodes:
-                f = self._admin.get_features(node=n)
-                by_name = dict((f['name'], f) for f in f['features'])
-                try:
-                    state = by_name[feature_name]['state']
-                except KeyError:
-                    state = None
-
+                state = self.get_feature_state(feature_name)
                 if state != await_state:
                     self.logger.info(
                         f"Feature {feature_name} not yet {await_state} on {n.name} (state {state})"
@@ -3781,6 +3948,12 @@ class RedpandaService(RedpandaServiceBase):
 
     def clean(self, **kwargs):
         super().clean(**kwargs)
+        # If we bypassed bucket creation, there is no need to try to delete it.
+        if self._si_settings and self._si_settings.bypass_bucket_creation:
+            self.logger.info(
+                f"Skipping deletion of bucket/container: {self.si_settings.cloud_storage_bucket},"
+                "because its creation was bypassed.")
+            return
         if self._cloud_storage_client:
             try:
                 self.delete_bucket_from_si()
@@ -3921,7 +4094,8 @@ class RedpandaService(RedpandaServiceBase):
                              node,
                              override_cfg_params=None,
                              auto_assign_node_id=False,
-                             omit_seeds_on_idx_one=True):
+                             omit_seeds_on_idx_one=True,
+                             node_id_override: int | None = None):
         """
         Write the node config file for a redpanda node: this is the YAML representation
         of Redpanda's `node_config` class.  Distinct from Redpanda's _cluster_ configuration
@@ -3930,7 +4104,11 @@ class RedpandaService(RedpandaServiceBase):
         node_info = {self.idx(n): n for n in self.nodes}
 
         include_seed_servers = True
-        node_id = self.idx(node)
+        if node_id_override:
+            assert auto_assign_node_id == False, "Can not use node id override when auto assigning node ids"
+            node_id = node_id_override
+        else:
+            node_id = self.idx(node)
         if omit_seeds_on_idx_one and node_id == 1:
             include_seed_servers = False
 
@@ -4564,7 +4742,8 @@ class RedpandaService(RedpandaServiceBase):
     def wait_for_controller_snapshot(self,
                                      node,
                                      prev_mtime=0,
-                                     prev_start_offset=0):
+                                     prev_start_offset=0,
+                                     timeout_sec=30):
         def check():
             snap_path = os.path.join(self.DATA_DIR,
                                      'redpanda/controller/0_0/snapshot')
@@ -4584,7 +4763,7 @@ class RedpandaService(RedpandaServiceBase):
             so = controller_status['start_offset']
             return (mtime > prev_mtime and so > prev_start_offset, (mtime, so))
 
-        return wait_until_result(check, timeout_sec=30, backoff_sec=1)
+        return wait_until_result(check, timeout_sec=timeout_sec, backoff_sec=1)
 
     def _get_object_storage_report(self,
                                    tolerate_empty_object_storage=False,
@@ -5045,6 +5224,62 @@ class RedpandaService(RedpandaServiceBase):
             return sum(s.value for s in samples.samples)
         else:
             return None
+
+    def wait_node_add_rebalance_finished(self,
+                                         new_nodes,
+                                         admin=None,
+                                         min_partitions=5,
+                                         progress_timeout=30,
+                                         timeout=300,
+                                         backoff=2):
+        """Waits until the rebalance triggered by adding new nodes is finished."""
+
+        new_node_names = [n.name for n in new_nodes]
+
+        if admin is None:
+            admin = Admin(self)
+        started_at = time.monotonic()
+        last_reconfiguring = set()
+        last_bytes_moved = 0
+        last_update = started_at
+
+        while True:
+            time.sleep(backoff)
+
+            if time.monotonic() - last_update > progress_timeout:
+                raise TimeoutError(
+                    f"rebalance after adding nodes {new_node_names} "
+                    "stopped making progress")
+
+            if time.monotonic() - started_at > timeout:
+                raise TimeoutError(
+                    f"rebalance after adding nodes {new_node_names} "
+                    "timed out")
+
+            cur_reconfiguring = set()
+            cur_bytes_moved = 0
+            for p in admin.list_reconfigurations():
+                cur_reconfiguring.add(
+                    f"{p['ns']}/{p['topic']}/{p['partition']}")
+                cur_bytes_moved += p['bytes_moved']
+
+            if (cur_reconfiguring != last_reconfiguring
+                    or cur_bytes_moved != last_bytes_moved):
+                last_update = time.monotonic()
+
+            last_reconfiguring = cur_reconfiguring
+            last_bytes_moved = cur_bytes_moved
+
+            if len(cur_reconfiguring) > 0:
+                continue
+
+            partition_counts = [
+                len(admin.get_partitions(node=n)) for n in new_nodes
+            ]
+            if any(pc < min_partitions for pc in partition_counts):
+                continue
+
+            return
 
 
 def make_redpanda_service(context: TestContext,

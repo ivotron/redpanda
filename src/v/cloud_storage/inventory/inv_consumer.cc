@@ -15,15 +15,19 @@
 #include "bytes/iostream.h"
 #include "cloud_storage/logger.h"
 #include "hashing/xx.h"
-#include "serde/serde.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/scalar.h"
+#include "serde/rw/vector.h"
 
 #include <seastar/core/file-types.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/coroutine/as_future.hh>
 
 #include <re2/re2.h>
 
+#include <exception>
 #include <ranges>
 
 namespace ranges = std::ranges;
@@ -32,9 +36,18 @@ namespace views = std::views;
 namespace {
 // hash-string/ns/tp/partition_rev/.*
 const RE2 path_expr{"^[[:xdigit:]]+/(.*?)/(.*?)/(\\d+)_\\d+/.*?"};
+
+// Holds hashes for a given NTP in memory before they will be flushed to disk.
+// One of these structures is held per NTP in a map keyed by the NTP itself.
 struct flush_entry {
     model::ntp ntp;
+    // The vector of hashes which will be written to disk in the file_name on
+    // next flush.
     fragmented_vector<uint64_t> hashes;
+    // The file to which hashes will be written. The file name is incremented on
+    // each flush, so each file name contains some hashes, and we may end up
+    // with multiple files per NTP. The hash loader will read all the files and
+    // collect the hashes together.
     uint64_t file_name;
 };
 
@@ -200,6 +213,11 @@ ss::future<> inventory_consumer::flush_ntp_hashes(
     }
 
     ntp_hash_path /= fmt::format("{}", file_name);
+    vlog(
+      cst_log.trace,
+      "Writing {} hashe(s) to file {}",
+      hashes.size(),
+      ntp_hash_path);
     co_return co_await ss::with_file_close_on_failure(
       ss::open_file_dma(
         ntp_hash_path.string(), ss::open_flags::create | ss::open_flags::wo),
@@ -210,18 +228,13 @@ ss::future<> inventory_consumer::flush_ntp_hashes(
 
 ss::future<> inventory_consumer::write_hashes_to_file(
   ss::file& f, fragmented_vector<uint64_t> hashes) {
-    vlog(cst_log.trace, "Writing {} hashe(s) to disk", hashes.size());
     std::exception_ptr ep;
     auto stream = co_await ss::make_file_output_stream(f);
-    try {
-        co_await write_hashes_to_file(stream, std::move(hashes));
-    } catch (...) {
-        ep = std::current_exception();
-    }
-
+    auto res = co_await ss::coroutine::as_future(
+      write_hashes_to_file(stream, std::move(hashes)));
     co_await stream.close();
-    if (ep) {
-        std::rethrow_exception(ep);
+    if (res.failed()) {
+        std::rethrow_exception(res.get_exception());
     }
 }
 

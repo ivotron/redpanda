@@ -21,7 +21,6 @@
 #include "kafka/protocol/fwd.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -601,7 +600,7 @@ inline void parse_and_set_bool(
             property.value = string_switch<bool>(*value)
                                .match("true", true)
                                .match("false", false);
-        } catch (std::runtime_error) {
+        } catch (const std::runtime_error&) {
             // Our callers expect this exception type on malformed values
             throw boost::bad_lexical_cast();
         }

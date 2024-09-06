@@ -10,9 +10,11 @@
 #include "bytes/bytes.h"
 #include "bytes/hash.h"
 #include "bytes/iostream.h"
-#include "bytes/tests/utils.h"
+#include "utils.h"
 
 #include <seastar/testing/thread_test_case.hh>
+
+#include <absl/hash/hash.h>
 
 SEASTAR_THREAD_TEST_CASE(test_reading_zero_bytes_empty_stream) {
     auto buf = iobuf();

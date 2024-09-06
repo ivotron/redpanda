@@ -22,6 +22,8 @@
 #include "serde/rw/vector.h"
 #include "utils/named_type.h"
 
+#include <seastar/core/sstring.hh>
+
 #include <absl/container/flat_hash_set.h>
 
 #include <ranges>
@@ -37,16 +39,16 @@ using consumer_group = named_type<ss::sstring, struct consumer_group_tag>;
 /**
  * Migration state
  *  ┌─────────┐
- *  │ planned ├────────────────────┐
- *  └────┬────┘                    │
- *       │                         │
- * ┌─────▼─────┐                   │
- * │ preparing ├─────────────────┐ │
- * └─────┬─────┘                 │ │
- *       │                       │ │
- * ┌─────▼────┐          ┌───────▼─▼──┐
- * │ prepared ├──────────► cancelling │
- * └─────┬────┘          └▲──▲─┬──────┘
+ *  │ planned ├───────────────────┐
+ *  └────┬────┘                   │
+ *       │                        │
+ * ┌─────▼─────┐                  │
+ * │ preparing ├────────────────┐ │
+ * └─────┬─────┘                │ │
+ *       │                      │ │
+ * ┌─────▼────┐          ┌──────▼─▼──┐
+ * │ prepared ├──────────► canceling │
+ * └─────┬────┘          └▲──▲─┬─────┘
  *       │                │  │ │
  * ┌─────▼─────┐          │  │ │
  * │ executing ├──────────┘  │ │
@@ -57,8 +59,12 @@ using consumer_group = named_type<ss::sstring, struct consumer_group_tag>;
  * └─────┬────┘                │
  *       │                     │
  * ┌─────▼────┐          ┌─────▼─────┐
- * │ finished │          │ cancelled │
- * └──────────┘          └───────────┘
+ * │ cut_over │          │ cancelled │
+ * └─────┬────┘          └───────────┘
+ *       │
+ * ┌─────▼────┐
+ * │ finished │
+ * └──────────┘
  */
 enum class state {
     planned,
@@ -66,6 +72,7 @@ enum class state {
     prepared,
     executing,
     executed,
+    cut_over,
     finished,
     canceling,
     cancelled,
@@ -91,8 +98,9 @@ std::ostream& operator<<(std::ostream& o, migrated_replica_status);
  */
 enum class migrated_resource_state {
     non_restricted,
-    restricted,
-    blocked,
+    metadata_locked,
+    read_only,
+    fully_blocked
 };
 
 std::ostream& operator<<(std::ostream& o, migrated_resource_state);
@@ -115,9 +123,13 @@ struct cloud_storage_location
     friend std::ostream&
     operator<<(std::ostream&, const cloud_storage_location&);
 
+    ss::sstring hint;
+
     friend bool
     operator==(const cloud_storage_location&, const cloud_storage_location&)
       = default;
+
+    auto serde_fields() { return std::tie(hint); }
 };
 
 /**
@@ -170,8 +182,6 @@ struct inbound_migration
 
     inbound_migration copy() const;
 
-    static std::optional<state> next_replica_state(state state);
-
     auto serde_fields() { return std::tie(topics, groups); }
 
     friend bool operator==(const inbound_migration&, const inbound_migration&)
@@ -180,8 +190,7 @@ struct inbound_migration
 
     auto topic_nts() const {
         return std::as_const(topics)
-               | std::views::transform(
-                 [](const inbound_topic& it) { return it.source_topic_name; });
+               | std::views::transform(&inbound_topic::effective_topic_name);
     }
 };
 
@@ -195,6 +204,8 @@ struct inbound_migration
 struct copy_target
   : serde::envelope<copy_target, serde::version<0>, serde::compat_version<0>> {
     ss::sstring bucket;
+
+    auto serde_fields() { return std::tie(bucket); }
 
     friend bool operator==(const copy_target&, const copy_target&) = default;
     friend std::ostream& operator<<(std::ostream&, const copy_target&);
@@ -219,8 +230,6 @@ struct outbound_migration
 
     outbound_migration copy() const;
 
-    static std::optional<state> next_replica_state(state state);
-
     auto serde_fields() { return std::tie(topics, groups, copy_to); }
 
     friend bool operator==(const outbound_migration&, const outbound_migration&)
@@ -229,6 +238,7 @@ struct outbound_migration
 
     auto topic_nts() const { return std::as_const(topics) | std::views::all; }
 };
+
 /**
  * Variant representing a migration. It can be either inbound or outbound data
  * migration.
@@ -236,6 +246,38 @@ struct outbound_migration
 using data_migration = serde::variant<inbound_migration, outbound_migration>;
 
 data_migration copy_migration(const data_migration& migration);
+
+/* Additional info worker needs from backend to work on a partition */
+struct inbound_partition_work_info {
+    std::optional<model::topic_namespace> source;
+    std::optional<cloud_storage_location> cloud_storage_location;
+};
+struct outbound_partition_work_info {
+    std::optional<copy_target> copy_to;
+};
+using partition_work_info
+  = std::variant<inbound_partition_work_info, outbound_partition_work_info>;
+struct partition_work {
+    id migration_id;
+    state sought_state;
+    partition_work_info info;
+};
+
+/* Additional info worker needs from backend to work on a topic */
+struct inbound_topic_work_info {
+    std::optional<model::topic_namespace> source;
+    std::optional<cloud_storage_location> cloud_storage_location;
+};
+struct outbound_topic_work_info {
+    std::optional<copy_target> copy_to;
+};
+using topic_work_info
+  = std::variant<inbound_topic_work_info, outbound_topic_work_info>;
+struct topic_work {
+    id migration_id;
+    state sought_state;
+    topic_work_info info;
+};
 
 /**
  * Data migration metadata containing a migration definition, its id and current
@@ -257,8 +299,6 @@ struct migration_metadata
         return migration_metadata{
           .id = id, .migration = copy_migration(migration), .state = state};
     }
-
-    std::optional<data_migrations::state> next_replica_state() const;
 
     auto serde_fields() { return std::tie(id, migration, state); }
 

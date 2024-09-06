@@ -414,7 +414,7 @@ class StatusThread(threading.Thread):
                 # status read
                 return
             else:
-                self._stop_requested.wait(self.INTERVAL)
+                self._shutdown_requested.wait(self.INTERVAL)
 
     def join_with_timeout(self):
         """
@@ -436,6 +436,7 @@ class StatusThread(threading.Thread):
         """
         Drop out of poll loop as soon as possible, and join.
         """
+        self._shutdown_requested.set()
         self._stop_requested.set()
         self.join_with_timeout()
 
@@ -598,8 +599,13 @@ class KgoVerifierProducer(KgoVerifierService):
             # the same topic, or that Redpanda showed a buggy behavior with
             # idempotency: producer records should always land at the next offset
             # after the last record they wrote.
-            raise RuntimeError(
-                f"{self.who_am_i()} possible idempotency bug: {self._status}")
+            if self._tolerate_data_loss:
+                self._redpanda.logger.warn(
+                    f"{self.who_am_i()} observed data loss: {self._status}")
+            else:
+                raise RuntimeError(
+                    f"{self.who_am_i()} possible idempotency bug: {self._status}"
+                )
 
         return super().wait_node(node, timeout_sec=timeout_sec)
 

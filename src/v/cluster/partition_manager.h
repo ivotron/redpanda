@@ -11,9 +11,9 @@
 
 #pragma once
 
-#include "archival/fwd.h"
 #include "cloud_storage/fwd.h"
 #include "cloud_storage/remote_path_provider.h"
+#include "cluster/archival/fwd.h"
 #include "cluster/fwd.h"
 #include "cluster/ntp_callbacks.h"
 #include "cluster/partition.h"
@@ -91,14 +91,15 @@ public:
       storage::ntp_config,
       raft::group_id,
       std::vector<model::broker>,
+      raft::with_learner_recovery_throttle,
+      raft::keep_snapshotted_log,
+      std::optional<xshard_transfer_state>,
       std::optional<remote_topic_properties> = std::nullopt,
       std::optional<cloud_storage_clients::bucket_name> = std::nullopt,
-      raft::with_learner_recovery_throttle
-      = raft::with_learner_recovery_throttle::yes,
-      raft::keep_snapshotted_log = raft::keep_snapshotted_log::no,
-      std::optional<cloud_storage::remote_label> = std::nullopt);
+      std::optional<cloud_storage::remote_label> = std::nullopt,
+      std::optional<model::topic_namespace> = std::nullopt);
 
-    ss::future<> shutdown(const model::ntp& ntp);
+    ss::future<xshard_transfer_state> shutdown(const model::ntp& ntp);
 
     ss::future<> remove(const model::ntp& ntp, partition_removal_mode mode);
 
@@ -253,7 +254,7 @@ private:
       std::optional<remote_topic_properties> rtp,
       cloud_storage::remote_path_provider& path_provider);
 
-    ss::future<> do_shutdown(ss::lw_shared_ptr<partition>);
+    ss::future<xshard_transfer_state> do_shutdown(ss::lw_shared_ptr<partition>);
 
     void check_partitions_shutdown_state();
 
@@ -290,7 +291,7 @@ private:
     bool _block_new_leadership{false};
 
     // Our handle from registering for leadership notifications on group_manager
-    std::optional<cluster::notification_id_type> _leader_notify_handle;
+    std::optional<raft::group_manager_notification_id> _leader_notify_handle;
 
     state_machine_registry _stm_registry;
 

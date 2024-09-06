@@ -384,7 +384,7 @@ constexpr static std::array feature_schema{
     cluster::cluster_version{13},
     "node_local_core_assignment",
     feature::node_local_core_assignment,
-    feature_spec::available_policy::new_clusters_only,
+    feature_spec::available_policy::explicit_only,
     feature_spec::prepare_policy::requires_migration},
   feature_spec{
     cluster::cluster_version{13},
@@ -556,6 +556,7 @@ public:
       : serde::
           envelope<version_fence, serde::version<0>, serde::compat_version<0>> {
         cluster::cluster_version active_version;
+        auto serde_fields() { return std::tie(active_version); }
     };
 
     static constexpr std::string_view version_fence_batch_key = "state";

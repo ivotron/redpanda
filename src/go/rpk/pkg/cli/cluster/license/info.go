@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -26,7 +27,7 @@ func newInfoCommand(fs afero.Fs, p *config.Params) *cobra.Command {
     Expires:         Expiration date of the license
     Version:         License schema version.
 `,
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
@@ -45,7 +46,7 @@ func newInfoCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 				}
 			}
 
-			if info.Properties != (adminapi.LicenseProperties{}) {
+			if info.Properties != (rpadmin.LicenseProperties{}) {
 				expired := info.Properties.Expires < 0
 				if format == "json" {
 					tm := time.Unix(info.Properties.Expires, 0).Format("Jan 2 2006")
@@ -71,7 +72,7 @@ func newInfoCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	return cmd
 }
 
-func printLicenseInfo(p adminapi.LicenseProperties, expired bool) {
+func printLicenseInfo(p rpadmin.LicenseProperties, expired bool) {
 	out.Section("LICENSE INFORMATION")
 	licenseFormat := `Organization:      %v
 Type:              %v

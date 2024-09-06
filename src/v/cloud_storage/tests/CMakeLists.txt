@@ -35,6 +35,25 @@ rp_test(
 
 rp_test(
   UNIT_TEST
+  GTEST
+  BINARY_NAME gtest_cloud_storage
+  SOURCES
+    topic_mount_manifest_test.cc
+  LIBRARIES
+    v::gtest_main
+    v::seastar_testing_main
+    v::cloud_storage
+    v::storage_test_utils
+    v::cloud_roles
+    v::application
+    v::kafka_test_utils
+    v::http_test_utils
+  ARGS "-- -c 1"
+  LABELS cloud_storage
+)
+
+rp_test(
+  UNIT_TEST
   BINARY_NAME topic_manifest
   SOURCES topic_manifest_test.cc
   LIBRARIES v::seastar_testing_main Boost::unit_test_framework v::cluster
@@ -53,7 +72,6 @@ rp_test(
     remote_segment_test.cc
     remote_partition_test.cc
     topic_recovery_service_test.cc
-    cloud_storage_e2e_test.cc
     delete_records_e2e_test.cc
     async_manifest_view_test.cc
     read_replica_test.cc
@@ -79,11 +97,14 @@ rp_test(
   TIMEOUT 1000
   BINARY_NAME gtest_cloud_storage
   SOURCES
+    cloud_storage_e2e_test.cc
     partition_manifest_downloader_test.cc
     remote_path_provider_test.cc
     remote_test.cc
     s3_imposter.cc
     topic_manifest_downloader_test.cc
+    topic_namespace_override_recovery_test.cc
+    topic_mount_handler_test.cc
     util.cc
   LIBRARIES
     v::gtest_main

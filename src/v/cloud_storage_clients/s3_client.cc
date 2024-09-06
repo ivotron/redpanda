@@ -483,7 +483,9 @@ ss::future<result<T, error_outcome>> s3_client::send_request(
     try {
         co_return co_await std::move(request_future);
     } catch (const rest_error_response& err) {
-        if (err.code() == s3_error_code::no_such_key) {
+        if (
+          err.code() == s3_error_code::no_such_key
+          || err.code() == s3_error_code::no_such_configuration) {
             // Unexpected 404s are logged by 'request_future' at warn
             // level, so only log at debug level here.
             vlog(s3_log.debug, "NoSuchKey response received {}", key);
@@ -554,27 +556,23 @@ s3_client::s3_client(
 
 ss::future<result<client_self_configuration_output, error_outcome>>
 s3_client::self_configure() {
+    auto result = s3_self_configuration_result{
+      .url_style = s3_url_style::virtual_host};
+    // Oracle cloud storage only supports path-style requests
+    // (https://www.oracle.com/ca-en/cloud/storage/object-storage/faq/#category-amazon),
+    // but self-configuration will misconfigure to virtual-host style due to a
+    // ListObjects request that happens to succeed. Override for this
+    // specific case.
+    auto inferred_backend = infer_backend_from_uri(_requestor._ap);
+    if (inferred_backend == model::cloud_storage_backend::oracle_s3_compat) {
+        result.url_style = s3_url_style::path;
+        co_return result;
+    }
+
     // Test virtual host style addressing, fall back to path if necessary.
     // If any configuration options prevent testing, addressing style will
     // default to virtual_host.
     // If both addressing methods fail, return an error.
-    auto result = s3_self_configuration_result{
-      .url_style = s3_url_style::virtual_host};
-    const auto remote_read
-      = config::shard_local_cfg().cloud_storage_enable_remote_read();
-    const auto remote_write
-      = config::shard_local_cfg().cloud_storage_enable_remote_write();
-    if (!remote_read && !remote_write) {
-        vlog(
-          s3_log.warn,
-          "Could not self-configure S3 Client, {}, {} are not enabled. "
-          "Defaulting to {} ",
-          config::shard_local_cfg().cloud_storage_enable_remote_read.name(),
-          config::shard_local_cfg().cloud_storage_enable_remote_write.name(),
-          result.url_style);
-        co_return result;
-    }
-
     const auto& bucket_config = config::shard_local_cfg().cloud_storage_bucket;
 
     if (!bucket_config.value().has_value()) {
@@ -594,7 +592,7 @@ s3_client::self_configure() {
       _requestor._ap_style == s3_url_style::virtual_host,
       "_ap_style should be virtual host by default before self configuration "
       "begins");
-    if (co_await self_configure_test(bucket, remote_read, remote_write)) {
+    if (co_await self_configure_test(bucket)) {
         // Virtual-host style request succeeded.
         co_return result;
     }
@@ -609,7 +607,7 @@ s3_client::self_configure() {
     // Test path style.
     _requestor._ap_style = s3_url_style::path;
     result.url_style = _requestor._ap_style;
-    if (co_await self_configure_test(bucket, remote_read, remote_write)) {
+    if (co_await self_configure_test(bucket)) {
         // Path style request succeeded.
         co_return result;
     }
@@ -623,41 +621,12 @@ s3_client::self_configure() {
     co_return error_outcome::fail;
 }
 
-ss::future<bool> s3_client::self_configure_test(
-  const bucket_name& bucket, bool remote_read, bool remote_write) {
-    if (remote_read) {
-        // Verify with a list objects request.
-        auto list_objects_result = co_await list_objects(
-          bucket, std::nullopt, std::nullopt, 1);
-        co_return list_objects_result;
-    } else {
-        vassert(remote_write, "Remote write is not enabled");
-        // Verify with a upload and delete request.
-        auto now = ss::lowres_clock::now();
-        const ss::sstring key_and_payload = fmt::format(
-          "S3ClientSelfConfigurationKey.{}", now.time_since_epoch().count());
-        iobuf payload;
-        payload.append(key_and_payload.data(), key_and_payload.size());
-        auto payload_stream = make_iobuf_input_stream(std::move(payload));
-        const ss::lowres_clock::duration timeout = {std::chrono::seconds(30)};
-
-        auto upload_object_result = co_await put_object(
-          bucket,
-          object_key{key_and_payload},
-          key_and_payload.size(),
-          std::move(payload_stream),
-          timeout);
-
-        if (!upload_object_result) {
-            // Upload failed, return early.
-            co_return upload_object_result;
-        }
-
-        // Clean up uploaded object.
-        auto delete_object_result = co_await delete_object(
-          bucket, object_key{key_and_payload}, timeout);
-        co_return (upload_object_result && delete_object_result);
-    }
+ss::future<bool> s3_client::self_configure_test(const bucket_name& bucket) {
+    // Check that the current addressing-style works by issuing a ListObjects
+    // request.
+    auto list_objects_result = co_await list_objects(
+      bucket, std::nullopt, std::nullopt, 1);
+    co_return list_objects_result;
 }
 
 ss::future<> s3_client::stop() { return _client.stop(); }
@@ -813,9 +782,11 @@ ss::future<result<s3_client::no_response, error_outcome>> s3_client::put_object(
   object_key const& key,
   size_t payload_size,
   ss::input_stream<char> body,
-  ss::lowres_clock::duration timeout) {
+  ss::lowres_clock::duration timeout,
+  bool accept_no_content) {
     return send_request(
-      do_put_object(name, key, payload_size, std::move(body), timeout)
+      do_put_object(
+        name, key, payload_size, std::move(body), timeout, accept_no_content)
         .then(
           []() { return ss::make_ready_future<no_response>(no_response{}); }),
       name,
@@ -827,7 +798,8 @@ ss::future<> s3_client::do_put_object(
   object_key const& id,
   size_t payload_size,
   ss::input_stream<char> body,
-  ss::lowres_clock::duration timeout) {
+  ss::lowres_clock::duration timeout,
+  bool accept_no_content) {
     auto header = _requestor.make_unsigned_put_object_request(
       name, id, payload_size);
     if (!header) {
@@ -839,18 +811,22 @@ ss::future<> s3_client::do_put_object(
     vlog(s3_log.trace, "send https request:\n{}", header.value());
     return ss::do_with(
       std::move(body),
-      [this, timeout, header = std::move(header), id](
+      [this, timeout, header = std::move(header), id, accept_no_content](
         ss::input_stream<char>& body) mutable {
           auto make_request = [this, &header, &body, &timeout]() {
               return _client.request(std::move(header.value()), body, timeout);
           };
 
           return ss::futurize_invoke(make_request)
-            .then([id](const http::client::response_stream_ref& ref) {
+            .then([id, accept_no_content](
+                    const http::client::response_stream_ref& ref) {
                 return util::drain_response_stream(ref).then(
-                  [ref, id](iobuf&& res) {
+                  [ref, id, accept_no_content](iobuf&& res) {
                       auto status = ref->get_headers().result();
-                      if (status != boost::beast::http::status::ok) {
+                      using enum boost::beast::http::status;
+                      if (const auto is_no_content_and_accepted
+                          = status == no_content && accept_no_content;
+                          status != ok && !is_no_content_and_accepted) {
                           vlog(
                             s3_log.warn,
                             "S3 PUT request failed for key {}: {} {:l}",

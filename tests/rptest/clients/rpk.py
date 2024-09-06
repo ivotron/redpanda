@@ -126,6 +126,17 @@ class RpkGroup(typing.NamedTuple):
     partitions: list[RpkGroupPartition]
 
 
+class RpkListGroup(typing.NamedTuple):
+    broker: str
+    group: str
+    state: str
+
+    @staticmethod
+    def from_line(line: str):
+        parts = line.split()
+        return RpkListGroup(broker=parts[0], group=parts[1], state=parts[2])
+
+
 class RpkWasmListProcessorResponse(typing.NamedTuple):
     node_id: int
     partition: int
@@ -517,10 +528,11 @@ class RpkTool:
 
         return self._run(cmd)
 
-    def sasl_update_user(self, user, new_password):
+    def sasl_update_user(self, user, new_password, new_mechanism):
         cmd = [
             "acl", "user", "update", user, "--new-password", new_password,
-            "-X", "admin.hosts=" + self._redpanda.admin_endpoints()
+            "--mechanism", new_mechanism, "-X",
+            "admin.hosts=" + self._redpanda.admin_endpoints()
         ]
         return self._run(cmd)
 
@@ -935,11 +947,16 @@ class RpkTool:
         cmd = ["delete", group]
         self._run_group(cmd)
 
-    def group_list(self):
+    def group_list(self, states: list[str] = []) -> list[RpkListGroup]:
         cmd = ['list']
+        if states:
+            cmd += ['--states', ','.join(states)]
         out = self._run_group(cmd)
 
-        return [l.split()[1] for l in out.splitlines()[1:]]
+        return [RpkListGroup.from_line(l) for l in out.splitlines()[1:]]
+
+    def group_list_names(self) -> list[str]:
+        return [res.group for res in self.group_list()]
 
     def wasm_remove(self, name):
         cmd = ['wasm', 'remove', name, '--brokers', self._redpanda.brokers()]
@@ -1696,6 +1713,33 @@ class RpkTool:
 
         return self._run_registry(cmd)
 
+    def get_mode(self, subjects=[], includeGlobal=True, format="json"):
+        cmd = ["mode", "get"]
+
+        if includeGlobal:
+            cmd += ["--global"]
+
+        if len(subjects) > 0:
+            cmd += subjects
+
+        return self._run_registry(cmd, output_format=format)
+
+    def set_mode(self, mode, subjects=[], format="json"):
+        cmd = ["mode", "set", "--mode", mode]
+
+        if len(subjects) > 0:
+            cmd += subjects
+
+        return self._run_registry(cmd, output_format=format)
+
+    def reset_mode(self, subjects=[], format="json"):
+        cmd = ["mode", "reset"]
+
+        if len(subjects) > 0:
+            cmd += subjects
+
+        return self._run_registry(cmd, output_format=format)
+
     def _run_wasm(self, rest):
         cmd = [self._rpk_binary(), "transform"]
         cmd += ["-X", "admin.hosts=" + self._redpanda.admin_endpoints()]
@@ -1910,6 +1954,10 @@ class RpkTool:
                                         output_format=output_format,
                                         node=node)
 
+    def import_cluster_quota(self, source, output_format="json"):
+        cmd = ["import", "--no-confirm", "--from", source]
+        return self._run_cluster_quotas(cmd, output_format=output_format)
+
     def _run_cluster_quotas(self,
                             cmd,
                             output_format="json",
@@ -1925,3 +1973,8 @@ class RpkTool:
         out = self._execute(cmd)
 
         return json.loads(out) if output_format == "json" else out
+
+    def run_mock_plugin(self, cmd):
+        cmd = [self._rpk_binary(), "pluginmock"] + cmd
+        out = self._execute(cmd)
+        return json.loads(out)

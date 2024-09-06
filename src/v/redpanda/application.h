@@ -11,12 +11,13 @@
 
 #pragma once
 
-#include "archival/fwd.h"
 #include "base/seastarx.h"
 #include "cloud_storage/fwd.h"
 #include "cloud_storage_clients/client_pool.h"
+#include "cluster/archival/fwd.h"
 #include "cluster/config_manager.h"
 #include "cluster/fwd.h"
+#include "cluster/inventory_service.h"
 #include "cluster/migrations/tx_manager_migrator.h"
 #include "cluster/node/local_monitor.h"
 #include "cluster/node_status_backend.h"
@@ -49,10 +50,10 @@
 #include "resource_mgmt/memory_sampling.h"
 #include "resource_mgmt/scheduling_groups_probe.h"
 #include "resource_mgmt/smp_groups.h"
+#include "resource_mgmt/storage.h"
 #include "rpc/fwd.h"
 #include "rpc/rpc_server.h"
 #include "security/fwd.h"
-#include "ssx/fwd.h"
 #include "storage/api.h"
 #include "storage/fwd.h"
 #include "transform/fwd.h"
@@ -118,6 +119,7 @@ public:
     ss::sharded<cluster::topic_recovery_status_frontend>
       topic_recovery_status_frontend;
     ss::sharded<cloud_storage::topic_recovery_service> topic_recovery_service;
+    ss::sharded<cluster::inventory_service> inventory_service;
 
     ss::sharded<cluster::tx_coordinator_mapper> tx_coordinator_ntp_mapper;
     ss::sharded<cluster::id_allocator_frontend> id_allocator_frontend;
@@ -132,7 +134,6 @@ public:
     ss::sharded<cluster::self_test_backend> self_test_backend;
     ss::sharded<cluster::self_test_frontend> self_test_frontend;
     ss::sharded<cluster::shard_table> shard_table;
-    ss::sharded<cluster::tm_stm_cache_manager> tm_stm_cache_manager;
     // only one instance on core 0
     ss::sharded<cluster::tx_topic_manager> tx_topic_manager;
     ss::sharded<cluster::tx_gateway_frontend> tx_gateway_frontend;
@@ -203,6 +204,10 @@ private:
         uint32_t _crash_count{0};
         uint64_t _config_checksum{0};
         model::timestamp _last_start_ts;
+
+        auto serde_fields() {
+            return std::tie(_crash_count, _config_checksum, _last_start_ts);
+        }
     };
 
     // Constructs and starts the services required to provide cryptographic

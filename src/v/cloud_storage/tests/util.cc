@@ -13,6 +13,7 @@
 #include "cloud_storage/partition_manifest_downloader.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
+#include "utils/stream_provider.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/util/defer.hh>
@@ -26,7 +27,7 @@
 
 namespace cloud_storage {
 
-static const remote_path_provider path_provider(std::nullopt);
+static const remote_path_provider path_provider(std::nullopt, std::nullopt);
 
 segment_layout
 generate_segment_layout(int num_segments, int seed, bool exclude_tx_fence) {
@@ -626,7 +627,7 @@ partition_manifest hydrate_manifest(
   remote& api, const cloud_storage_clients::bucket_name& bucket) {
     static ss::abort_source never_abort;
 
-    remote_path_provider path_provider(std::nullopt);
+    remote_path_provider path_provider(std::nullopt, std::nullopt);
     partition_manifest_downloader dl(
       bucket, path_provider, manifest_ntp, manifest_revision, api);
     partition_manifest m(manifest_ntp, manifest_revision);
@@ -987,8 +988,7 @@ void reupload_compacted_segments(
             bb.resize(body.size());
             std::memcpy(bb.data(), body.data(), body.size());
             auto reset_stream = [body = std::move(bb)] {
-                return ss::make_ready_future<
-                  std::unique_ptr<storage::stream_provider>>(
+                return ss::make_ready_future<std::unique_ptr<stream_provider>>(
                   std::make_unique<storage::segment_reader_handle>(
                     make_iobuf_input_stream(bytes_to_iobuf(body))));
             };

@@ -24,6 +24,12 @@
 namespace pp = pandaproxy;
 namespace pps = pp::schema_registry;
 
+bool check_compatible(
+  const pps::json_schema_definition& reader_schema,
+  const pps::json_schema_definition& writer_schema) {
+    return pps::check_compatible(reader_schema, writer_schema).is_compat;
+}
+
 struct store_fixture {
     store_fixture() {
         store.start(pps::is_mutable::yes, ss::default_smp_service_group())
@@ -64,8 +70,7 @@ static const auto error_test_cases = std::to_array({
     R"({"type": "thisisnotapropertype"})",
     pps::error_info{
       pps::error_code::schema_invalid,
-      "Invalid json schema: '#/type', invalid metaschema: '#/properties/type', "
-      "invalid keyword: 'anyOf'"}},
+      R"(Invalid json schema: '{"type":"thisisnotapropertype"}'. Error: ': Must be valid against all schemas, but found unmatched schemas')"}},
   error_test_case{
     R"({"$schema": "unsupported_dialect"})",
     pps::error_info{
@@ -76,6 +81,18 @@ static const auto error_test_cases = std::to_array({
     pps::error_info{
       pps::error_code::schema_invalid,
       "Unsupported json schema dialect: '42'"}},
+  // exclusiveMinimum is a bool in draft 4 but it is a double in draft 6
+  error_test_case{
+    R"(
+{
+  "$schema": "http://json-schema.org/draft-06/schema#",
+  "type": "number",
+  "minimum": 0,
+  "exclusiveMinimum": false
+})",
+    pps::error_info{
+      pps::error_code::schema_invalid,
+      R"(Invalid json schema: '{"$schema":"http://json-schema.org/draft-06/schema#","exclusiveMinimum":false,"minimum":0,"type":"number"}'. Error: '/exclusiveMinimum: Expected number, found boolean')"}},
 });
 SEASTAR_THREAD_TEST_CASE(test_make_invalid_json_schema) {
     for (const auto& data : error_test_cases) {
@@ -86,6 +103,8 @@ SEASTAR_THREAD_TEST_CASE(test_make_invalid_json_schema) {
                   f.store,
                   {pps::subject{"test"}, {data.def, pps::schema_type::json}})
                   .get();
+                BOOST_CHECK_MESSAGE(
+                  false, "terminated without an exception for invalid schema");
             } catch (pps::exception const& e) {
                 BOOST_CHECK_EQUAL(e.code(), data.err.code());
                 BOOST_WARN_MESSAGE(
@@ -123,13 +142,6 @@ static constexpr auto valid_test_cases = std::to_array<std::string_view>({
   "minimum": 0,
   "exclusiveMinimum": false
 })",
-  R"(
-{
-  "$schema": "http://json-schema.org/draft-05/schema#",
-  "type": "number",
-  "minimum": 0,
-  "exclusiveMinimum": false
-})",
   R"json(
 {
   "$schema": "http://json-schema.org/draft-06/schema#",
@@ -162,8 +174,9 @@ static constexpr auto valid_test_cases = std::to_array<std::string_view>({
   )json",
   R"json({"$schema": "http://json-schema.org/draft-07/schema"})json",
   R"json({"$schema": "http://json-schema.org/draft-06/schema"})json",
-  R"json({"$schema": "http://json-schema.org/draft-05/schema"})json",
   R"json({"$schema": "http://json-schema.org/draft-04/schema"})json",
+  R"json({"$schema": "https://json-schema.org/draft/2019-09/schema"})json",
+  R"json({"$schema": "https://json-schema.org/draft/2020-12/schema"})json",
 });
 SEASTAR_THREAD_TEST_CASE(test_make_valid_json_schema) {
     for (const auto& data : valid_test_cases) {
@@ -192,7 +205,7 @@ struct test_references_data {
         pps::unparsed_schema schema;
         pps::error_info result;
     };
-    std::vector<data> _schemas;
+    std::array<data, 2> _schemas;
 };
 
 const auto referenced = pps::unparsed_schema{
@@ -231,7 +244,7 @@ const auto referencer = pps::unparsed_schema{
 const auto referencer_wrong_sub = pps::unparsed_schema{
   referencer.sub(),
   pps::unparsed_schema_definition{
-    referencer.def().raw(),
+    referencer.def().shared_raw(),
     referencer.def().type(),
     {pps::schema_reference{
       .name = "example.com/referenced.json",
@@ -240,13 +253,13 @@ const auto referencer_wrong_sub = pps::unparsed_schema{
 
 const std::array test_reference_cases = {
   // Referece correct subject
-  test_references_data{{{referenced, {}}, {referencer, {}}}},
+  test_references_data{{{{referenced.share(), {}}, {referencer.share(), {}}}}},
   // Reference wrong subject
   test_references_data{
-    {{referenced, {}},
-     {referencer_wrong_sub,
-      {pps::error_code::schema_empty,
-       R"(Invalid schema {subject=referencer,version=0,id=-1,schemaType=JSON,references=[{name='example.com/referenced.json', subject='wrong_sub', version=1}],metadata=null,ruleSet=null,schema={
+    {{{referenced.share(), {}},
+      {referencer_wrong_sub.share(),
+       {pps::error_code::schema_empty,
+        R"(Invalid schema {subject=referencer,version=0,id=-1,schemaType=JSON,references=[{name='example.com/referenced.json', subject='wrong_sub', version=1}],metadata=null,ruleSet=null,schema={
   "description": "A schema that references the base schema",
   "type": "object",
   "properties": {
@@ -254,7 +267,7 @@ const std::array test_reference_cases = {
       "$ref": "example.com/referenced.json"
     }
   }
-}} with refs [{name='example.com/referenced.json', subject='wrong_sub', version=1}] of type JSON, details: No schema reference found for subject "wrong_sub" and version 1)"}}}}};
+}} with refs [{name='example.com/referenced.json', subject='wrong_sub', version=1}] of type JSON, details: No schema reference found for subject "wrong_sub" and version 1)"}}}}}};
 
 SEASTAR_THREAD_TEST_CASE(test_json_schema_references) {
     for (const auto& test : test_reference_cases) {
@@ -265,7 +278,7 @@ SEASTAR_THREAD_TEST_CASE(test_json_schema_references) {
             pps::schema_version ver{0};
             pps::canonical_schema canonical{};
             auto make_canonical = [&]() {
-                canonical = f.store.make_canonical_schema(schema).get();
+                canonical = f.store.make_canonical_schema(schema.share()).get();
             };
 
             if (result.code() == pps::error_code{}) {
@@ -280,7 +293,11 @@ SEASTAR_THREAD_TEST_CASE(test_json_schema_references) {
             }
             f.store
               .upsert(
-                pps::seq_marker{}, canonical, ++id, ++ver, pps::is_deleted::no)
+                pps::seq_marker{},
+                canonical.share(),
+                ++id,
+                ++ver,
+                pps::is_deleted::no)
               .get();
         }
     }
@@ -290,11 +307,18 @@ struct compatibility_test_case {
     std::string_view reader_schema;
     std::string_view writer_schema;
     bool reader_is_compatible_with_writer;
+    bool expected_exception = false;
 };
 
 static constexpr auto compatibility_test_cases = std::to_array<
   compatibility_test_case>({
   //***** not compatible section *****
+  // atoms
+  {
+    .reader_schema = "false",
+    .writer_schema = "true",
+    .reader_is_compatible_with_writer = false,
+  },
   // not allowed promotion
   {
     .reader_schema = R"({"type": "integer"})",
@@ -324,7 +348,7 @@ static constexpr auto compatibility_test_cases = std::to_array<
     .reader_is_compatible_with_writer = false,
   },
   {
-    .reader_schema = R"({"type": "number", "minumum": 1.1, "maximum": 3.199})",
+    .reader_schema = R"({"type": "number", "minimum": 1.1, "maximum": 3.199})",
     .writer_schema = R"({"type": "integer", "minimum": 1.1, "maximum": 3.2})",
     .reader_is_compatible_with_writer = false,
   },
@@ -334,8 +358,42 @@ static constexpr auto compatibility_test_cases = std::to_array<
     .reader_is_compatible_with_writer = false,
   },
   {
+    .reader_schema = R"({"type": "number", "multipleOf": 20})",
+    .writer_schema = R"({"type": "number", "multipleOf": 10})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
     .reader_schema = R"({"type": "number", "multipleOf": 10.1})",
     .writer_schema = R"({"type": "number", "multipleOf": 20.2001})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    .reader_schema
+    = R"({"type": "number", "maximum": 10, "exclusiveMaximum": true})",
+    .writer_schema = R"({"type": "number", "maximum": 10})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    .reader_schema = R"({"type": "number", "exclusiveMaximum": 10})",
+    .writer_schema = R"({"type": "number"})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    .reader_schema
+    = R"({"type": "number", "maximum": 10, "exclusiveMaximum": true})",
+    .writer_schema
+    = R"({"type": "number", "maximum": 10, "exclusiveMaximum": 10})",
+    .reader_is_compatible_with_writer = false,
+    .expected_exception = true,
+  },
+  {
+    .reader_schema = R"({"type": "number", "exclusiveMinimum": 10})",
+    .writer_schema = R"({"type": "number", "exclusiveMinimum": 9})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    .reader_schema = R"({"type": "number", "exclusiveMaximum": 9})",
+    .writer_schema = R"({"type": "number", "exclusiveMaximum": 10})",
     .reader_is_compatible_with_writer = false,
   },
   // string checks
@@ -400,20 +458,56 @@ static constexpr auto compatibility_test_cases = std::to_array<
     = R"({"type": "object", "properties": {"aaaa": {"type": "string"}}})",
     .reader_is_compatible_with_writer = false,
   },
-  // object checks: patternProperties need to be compatible
+  // object checks: dependencies removed
   {
-    .reader_schema
-    = R"({"type": "object", "patternProperties": {"^a": {"type": "integer"}}})",
-    .writer_schema
-    = R"({"type": "object", "patternProperties": {"^a": {"type": "number"}}})",
+    .reader_schema = R"(
+{
+  "type": "object",
+  "dependencies": {"a": ["b"], "b": ["a"]}
+})",
+    .writer_schema = R"({"type": "object"})",
     .reader_is_compatible_with_writer = false,
   },
-  // object checks: required needs to be compatible
+  // object checks: dependencies missing members
   {
-    .reader_schema
-    = R"({"type": "object", "properties": {"a": {"type": "integer"}}})",
-    .writer_schema
-    = R"({"type": "object", "properties": {"a": {"type": "integer", "default": 10}}, "required": ["a"]})",
+    .reader_schema = R"(
+{
+  "type": "object",
+  "dependencies": {"a": ["b"], "b": ["a"]}
+})",
+    .writer_schema = R"(
+{
+  "type": "object",
+  "dependencies": {"a": ["b"]}
+})",
+    .reader_is_compatible_with_writer = false,
+  },
+  // object checks: dependencies missing value in string array
+  {
+    .reader_schema = R"(
+{
+  "type": "object",
+  "dependencies": {"a": ["b", "c"]}
+})",
+    .writer_schema = R"(
+{
+  "type": "object",
+  "dependencies": {"a": ["b"]}
+})",
+    .reader_is_compatible_with_writer = false,
+  },
+  // object checks: dependencies incompatible schemas
+  {
+    .reader_schema = R"(
+{
+  "type": "object",
+  "dependencies": {"a": {"type": "integer"}}
+})",
+    .writer_schema = R"(
+{
+  "type": "object",
+  "dependencies": {"a": {"type": "number"}}
+})",
     .reader_is_compatible_with_writer = false,
   },
   // array checks: size increase is not allowed
@@ -453,7 +547,14 @@ static constexpr auto compatibility_test_cases = std::to_array<
     .reader_schema
     = R"({"type": "array", "additionalItems": {"type": "integer"}, "items": [{"type":"boolean"}]})",
     .writer_schema
-    = R"({"type": "array", "additionalItems": {"type": "integer"}, "items": [{"type":"boolean"}, {"type": "boolean"}]})",
+    = R"({"type": "array", "additionalItems": false, "items": [{"type":"boolean"}, {"type": "number"}]})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    .reader_schema
+    = R"({"type": "array", "additionalItems": {"type": "number"}, "items": [{"type":"boolean"}, {"type": "integer"}]})",
+    .writer_schema
+    = R"({"type": "array", "additionalItems": {"type": "number"}, "items": [{"type":"boolean"}]})",
     .reader_is_compatible_with_writer = false,
   },
   // combinators: "not" is required on both schema
@@ -471,7 +572,51 @@ static constexpr auto compatibility_test_cases = std::to_array<
     = R"({"type": ["integer", "number"], "not": {"type": "integer"}})",
     .reader_is_compatible_with_writer = false,
   },
+  // positive combinators: multiple combs
+  {
+    .reader_schema = R"({"type": "integer", "oneOf": [true], "anyOf": [true]})",
+    .writer_schema = R"({"type": "integer"})",
+    .reader_is_compatible_with_writer = false,
+    .expected_exception = true,
+  },
+  // positive combinators: mismatch of type
+  {
+    .reader_schema = R"({"type": "integer", "anyOf": [true]})",
+    .writer_schema = R"({"type": "integer"})",
+    .reader_is_compatible_with_writer = false,
+  },
+  // positive combinators: mismatch of size
+  {
+    .reader_schema = R"({"allOf": [true, false]})",
+    .writer_schema = R"({"allOf": [true]})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    .reader_schema = R"({"anyOf": [true]})",
+    .writer_schema = R"({"anyOf": [true, false]})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    .reader_schema = R"({"oneOf": [true]})",
+    .writer_schema = R"({"oneOf": [true, false]})",
+    .reader_is_compatible_with_writer = false,
+  },
+  // positive combinators: subschema mismatch
+  {
+    // note: this fails because for writer, there isn't s distinct matching
+    // schema in reader
+    .reader_schema = R"({"oneOf": [{"type":"number"}, {"type": "boolean"}]})",
+    .writer_schema
+    = R"({"oneOf": [{"type":"number", "multipleOf": 10}, {"type": "number", "multipleOf": 1.1}]})",
+    .reader_is_compatible_with_writer = false,
+  },
   //***** compatible section *****
+  // atoms
+  {
+    .reader_schema = "true",
+    .writer_schema = "false",
+    .reader_is_compatible_with_writer = true,
+  },
   // same type
   {
     .reader_schema = R"({"type": "boolean"})",
@@ -503,11 +648,42 @@ static constexpr auto compatibility_test_cases = std::to_array<
   },
   {
     .reader_schema = R"({"type": "number"})",
+    .writer_schema = R"({"type": "number", "exclusiveMaximum": 10})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema
+    = R"({"type": "number", "maximum": 10, "exclusiveMaximum": false})",
+    .writer_schema = R"({"type": "number", "maximum": 10})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"type": "number", "exclusiveMinimum": 10})",
+    .writer_schema = R"({"type": "number", "exclusiveMinimum": 10})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"type": "number", "exclusiveMinimum": 10})",
+    .writer_schema = R"({"type": "number", "exclusiveMinimum": 11})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"type": "number", "exclusiveMaximum": 10})",
+    .writer_schema = R"({"type": "number", "exclusiveMaximum": 10})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"type": "number", "exclusiveMaximum": 10})",
+    .writer_schema = R"({"type": "number", "exclusiveMaximum": 8})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"type": "number"})",
     .writer_schema = R"({"type": "number", "maximum": 11})",
     .reader_is_compatible_with_writer = true,
   },
   {
-    .reader_schema = R"({"type": "number", "minumum": 1.1, "maximum": 4})",
+    .reader_schema = R"({"type": "number", "minimum": 1.1, "maximum": 4})",
     .writer_schema = R"({"type": "number", "minimum": 1.1, "maximum": 3.2})",
     .reader_is_compatible_with_writer = true,
   },
@@ -519,6 +695,11 @@ static constexpr auto compatibility_test_cases = std::to_array<
   {
     .reader_schema = R"({"type": "number", "multipleOf": 10.1})",
     .writer_schema = R"({"type": "number", "multipleOf": 20.2})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"type": "number", "multipleOf": 1.1})",
+    .writer_schema = R"({"type": "number", "multipleOf": 3.3})",
     .reader_is_compatible_with_writer = true,
   },
   // string checks
@@ -575,6 +756,7 @@ static constexpr auto compatibility_test_cases = std::to_array<
   // - patternProperties evolve
   // - additionalProperties evolve
   // - required list increase
+  // - dependencies list increase
   {
     .reader_schema = R"(
 {
@@ -588,7 +770,8 @@ static constexpr auto compatibility_test_cases = std::to_array<
     "^b": {"type": "string"}
   },
   "additionalProperties": {"type": "boolean"},
-  "required": ["aaaa"]
+  "required": ["aaaa"],
+  "dependencies": {"a":["c", "b"], "b": {"type": "number"}}
 })",
     .writer_schema = R"(
 {
@@ -604,7 +787,34 @@ static constexpr auto compatibility_test_cases = std::to_array<
     "^b": {"type": "string", "minLength":10}
   },
   "additionalProperties": false,
-  "required": ["aaaa", "cccc"]
+  "required": ["aaaa", "cccc"],
+  "dependencies": {"a": ["b", "c", "d"], "b": {"type": "integer"}, "d": ["a"]}
+})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // object checks: a new required property is ok if it has a default value
+  {
+    .reader_schema = R"(
+{
+  "type": "object",
+  "properties": {
+    "a": {
+      "type": "integer"
+    }
+  }
+})",
+    .writer_schema = R"(
+{
+  "type": "object",
+  "properties": {
+    "a": {
+      "type": "integer",
+      "default": 10
+    }
+  },
+  "required": [
+    "a"
+  ]
 })",
     .reader_is_compatible_with_writer = true,
   },
@@ -654,12 +864,380 @@ static constexpr auto compatibility_test_cases = std::to_array<
   })",
     .reader_is_compatible_with_writer = true,
   },
+  // array checks: excess elements are absorbed by additionalItems
+  {
+    .reader_schema = R"(
+{
+  "type": "array",
+  "items": [
+    {
+      "type": "boolean"
+    }
+  ],
+  "additionalItems": {
+    "type": "number"
+  }
+})",
+    .writer_schema = R"(
+{
+  "type": "array",
+  "items": [
+    {
+      "type": "boolean"
+    },
+    {
+      "type": "integer"
+    }
+  ],
+  "additionalItems": false
+})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"(
+{
+  "type": "array",
+  "items": [
+    {
+      "type": "boolean"
+    },
+    {
+      "type": "number"
+    }
+  ],
+  "additionalItems": {"type": "number"}
+})",
+    .writer_schema = R"(
+{
+  "type": "array",
+  "items": [
+    {
+      "type": "boolean"
+    }
+  ],
+  "additionalItems": {
+    "type": "integer"
+  }
+})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"(
+{
+  "type": "array",
+  "items": [
+    {
+      "type": "boolean"
+    },
+    {
+      "type": "number"
+    }
+  ],
+  "additionalItems": false
+})",
+    .writer_schema = R"(
+{
+  "type": "array",
+  "items": [
+    {
+      "type": "boolean"
+    }
+  ],
+  "additionalItems": false
+})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // array checks: prefixItems/items are compatible across drafts
+  {
+    .reader_schema = R"({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "array",
+            "prefixItems": [
+                {
+                    "type": "integer"
+                }
+            ],
+            "items": false
+        })",
+
+    .writer_schema = R"({
+            "$schema": "http://json-schema.org/draft-04/schema#",
+            "type": "array",
+            "items": [
+                {
+                    "type": "integer"
+                }
+            ],
+            "additionalItems": false
+        })",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({
+            "$schema": "http://json-schema.org/draft-04/schema#",
+            "type": "array",
+            "items": [
+                {
+                    "type": "integer"
+                }
+            ],
+            "additionalItems": false
+        })",
+    .writer_schema = R"({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "array",
+            "prefixItems": [
+                {
+                    "type": "integer"
+                }
+            ],
+            "items": false
+        })",
+
+    .reader_is_compatible_with_writer = true,
+  },
   // combinators: "not"
   {
     .reader_schema
     = R"({"type": "integer", "not": {"type": "integer", "minimum": 10}})",
     .writer_schema
     = R"({"type": "integer", "not": {"type": "integer", "minimum": 5}})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // positive combinators
+  {
+    .reader_schema
+    = R"({"oneOf": [{"type":"number", "multipleOf": 3}, {"type": "boolean"}]})",
+    .writer_schema
+    = R"({"oneOf": [{"type":"boolean"}, {"type": "number", "multipleOf": 9}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // positive combinators special case: only writer has a combinator
+  {
+    .reader_schema = R"({"type": "object"})",
+    .writer_schema = R"(
+        {"type": "object",
+            "oneOf": [
+                {"type": "object", "properties": {"c": {"type": "string"}}},
+                {"type": "object", "properties": {"d": {"type": "array"}}}
+            ]
+        })",
+    .reader_is_compatible_with_writer = true,
+  },
+  // positive combinators single schema cases: the actual combinator does not
+  // matter
+  {
+    .reader_schema = R"({"anyOf": [{"type": "number"}]})",
+    .writer_schema = R"({"oneOf": [{"type": "integer"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"allOf": [{"type": "number"}]})",
+    .writer_schema = R"({"oneOf": [{"type": "integer"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"oneOf": [{"type": "number"}]})",
+    .writer_schema = R"({"anyOf": [{"type": "integer"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"allOf": [{"type": "number"}]})",
+    .writer_schema = R"({"anyOf": [{"type": "integer"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"anyOf": [{"type": "number"}]})",
+    .writer_schema = R"({"allOf": [{"type": "integer"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"oneOf": [{"type": "number"}]})",
+    .writer_schema = R"({"allOf": [{"type": "integer"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // positive combinators older is single schema, newer is allOf
+  {
+    .reader_schema = R"({"oneOf": [{"type": "number"}]})",
+    .writer_schema = R"({"allOf": [{"type": "integer"}, {"type": "string"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"anyOf": [{"type": "number"}]})",
+    .writer_schema = R"({"allOf": [{"type": "integer"}, {"type": "string"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // positive combinators older is oneOf, newer is single schema
+  {
+    .reader_schema = R"({"oneOf": [{"type": "number"}, {"type": "string"}]})",
+    .writer_schema = R"({"allOf": [{"type": "integer"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"oneOf": [{"type": "number"}, {"type": "string"}]})",
+    .writer_schema = R"({"anyOf": [{"type": "integer"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // positive combinators special cases: anyOf in reader can be compared with
+  // the other
+  // combinators
+  {
+    // smoke test identical schemas
+    .reader_schema
+    = R"({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .writer_schema
+    = R"({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    // smoke test smaller reader is not compatible
+    .reader_schema = R"({"anyOf": [{"type": "number"}, {"type": "string"}]})",
+    .writer_schema
+    = R"({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    // smoke test bigger reader is  compatible
+    .reader_schema
+    = R"({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .writer_schema = R"({"anyOf": [{"type": "number"}, {"type": "string"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    // oneOf in writer can only be smaller or equal
+    .reader_schema
+    = R"({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .writer_schema
+    = R"({"oneOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    // oneOf in writer can only be smaller or equal
+    .reader_schema = R"({"anyOf": [{"type": "number"}, {"type": "string"}]})",
+    .writer_schema
+    = R"({"oneOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .reader_is_compatible_with_writer = false,
+  },
+  {
+    // oneOf in writer can only be smaller or equal
+    .reader_schema
+    = R"({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .writer_schema = R"({"oneOf": [{"type": "number"}, {"type": "string"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    // allOf in writer can be compatible with any cardinality
+    .reader_schema
+    = R"({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .writer_schema
+    = R"({"allOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    // allOf in writer can be compatible with any cardinality
+    .reader_schema = R"({"anyOf": [{"type": "number"}, {"type": "string"}]})",
+    .writer_schema
+    = R"({"allOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    // allOf in writer can be compatible with any cardinality
+    .reader_schema
+    = R"({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}]})",
+    .writer_schema = R"({"allOf": [{"type": "number"}, {"type": "string"}]})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // dialects
+  {
+    .reader_schema = R"({"$schema": "http://json-schema.org/draft-06/schema"})",
+    .writer_schema
+    = R"({"$schema": "http://json-schema.org/draft-06/schema#"})",
+    .reader_is_compatible_with_writer = true,
+  },
+  // different dialects
+  {
+    .reader_schema = R"({"$schema": "http://json-schema.org/draft-04/schema"})",
+    .writer_schema
+    = R"({"$schema": "http://json-schema.org/draft-06/schema#"})",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({"$schema": "http://json-schema.org/draft-04/schema"})",
+    .writer_schema = "true",
+    .reader_is_compatible_with_writer = true,
+  },
+  // array checks: prefixItems/items are compatible across drafts, unspecified
+  // schema
+  {
+    .reader_schema = R"({
+            "type": "array",
+            "prefixItems": [
+                {
+                    "type": "integer"
+                }
+            ],
+            "items": false
+        })",
+
+    .writer_schema = R"({
+            "type": "array",
+            "items": [
+                {
+                    "type": "integer"
+                }
+            ],
+            "additionalItems": false
+        })",
+    .reader_is_compatible_with_writer = true,
+  },
+  {
+    .reader_schema = R"({
+            "type": "array",
+            "items": [
+                {
+                    "type": "integer"
+                }
+            ],
+            "additionalItems": false
+        })",
+    .writer_schema = R"({
+            "type": "array",
+            "prefixItems": [
+                {
+                    "type": "integer"
+                }
+            ],
+            "items": false
+        })",
+
+    .reader_is_compatible_with_writer = true,
+  },
+  // object: "patternProperties" is not involved in compat checks
+  {
+    .reader_schema = R"(
+{
+  "type": "object",
+  "patternProperties": {
+    "^a": {
+      "type": "boolean"
+    },
+    "^b": {
+      "type": "integer"
+    }
+  }
+})",
+    .writer_schema = R"(
+{
+  "type": "object",
+  "patternProperties": {
+    "^a": {
+      "type": "null"
+    },
+    "^c": {
+      "type": "string"
+    }
+  }
+})",
     .reader_is_compatible_with_writer = true,
   },
 });
@@ -681,17 +1259,36 @@ SEASTAR_THREAD_TEST_CASE(test_compatibility_check) {
           data.writer_schema,
           data.reader_is_compatible_with_writer)) {
             try {
+                // sanity check that each schema is compatible with itself
+                BOOST_CHECK_MESSAGE(
+                  ::check_compatible(
+                    make_json_schema(data.reader_schema),
+                    make_json_schema(data.reader_schema)),
+                  fmt::format(
+                    "reader '{}' should be compatible with itself",
+                    data.reader_schema));
+                BOOST_CHECK_MESSAGE(
+                  ::check_compatible(
+                    make_json_schema(data.writer_schema),
+                    make_json_schema(data.writer_schema)),
+                  fmt::format(
+                    "writer '{}' should be compatible with itself",
+                    data.writer_schema));
+
+                // check compatibility (or not) reader->writer
                 BOOST_CHECK_EQUAL(
                   data.reader_is_compatible_with_writer,
-                  pps::check_compatible(
+                  ::check_compatible(
                     make_json_schema(data.reader_schema),
                     make_json_schema(data.writer_schema)));
             } catch (...) {
                 BOOST_CHECK_MESSAGE(
-                  false,
+                  data.expected_exception,
                   fmt::format(
                     "terminated with exception {}", std::current_exception()));
+                continue;
             }
+            BOOST_CHECK_MESSAGE(!data.expected_exception, "no exception");
         }
     };
 }

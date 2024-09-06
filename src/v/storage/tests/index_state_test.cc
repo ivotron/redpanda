@@ -1,9 +1,19 @@
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
 #define BOOST_TEST_MODULE storage
+
 #include "bytes/bytes.h"
 #include "random/generators.h"
-#include "serde/serde.h"
+#include "serde/rw/envelope.h"
 #include "storage/index_state.h"
-#include "storage/index_state_serde_compat.h"
 
 #include <boost/test/unit_test.hpp>
 
@@ -37,7 +47,7 @@ static storage::index_state make_random_index_state(
     }
 
     if (apply_offset == storage::offset_delta_time::no) {
-        fragmented_vector<uint32_t> time_index;
+        chunked_vector<uint32_t> time_index;
         for (auto i = 0; i < n; ++i) {
             time_index.push_back(random_generators::get_int<uint32_t>());
         }
@@ -52,7 +62,8 @@ static void set_version(iobuf& buf, int8_t version) {
     auto tmp = iobuf_to_bytes(buf);
     buf.clear();
     buf.append((const char*)&version, sizeof(version));
-    buf.append(bytes_to_iobuf(tmp.substr(1)));
+    vassert(tmp.size() > 1, "unexpected buffer size: {}", tmp.size());
+    buf.append(tmp.data() + 1, tmp.size() - 1);
 }
 
 // encode/decode using new serde framework

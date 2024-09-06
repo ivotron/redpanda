@@ -19,6 +19,8 @@
 #include "raft/logger.h"
 #include "raft/state_machine_base.h"
 #include "raft/types.h"
+#include "serde/async.h"
+#include "serde/rw/rw.h"
 #include "ssx/future-util.h"
 #include "ssx/semaphore.h"
 #include "storage/snapshot.h"
@@ -233,7 +235,7 @@ ss::future<> state_machine_manager::apply_raft_snapshot() {
 ss::future<> state_machine_manager::do_apply_raft_snapshot(
   snapshot_metadata metadata,
   storage::snapshot_reader& reader,
-  std::vector<ssx::semaphore_units> background_apply_units) {
+  [[maybe_unused]] std::vector<ssx::semaphore_units> background_apply_units) {
     const auto snapshot_file_sz = co_await reader.get_snapshot_size();
     const auto last_offset = metadata.last_included_index;
 
@@ -281,7 +283,6 @@ ss::future<> state_machine_manager::do_apply_raft_snapshot(
           });
     }
     _next = model::next_offset(metadata.last_included_index);
-    background_apply_units.clear();
 }
 
 ss::future<> state_machine_manager::apply_snapshot_to_stm(
@@ -370,8 +371,10 @@ ss::future<> state_machine_manager::try_apply_in_foreground() {
           model::no_timeout);
 
         if (max_last_applied == model::offset{}) {
-            vlog(
-              _log.warn,
+            vlogl(
+              _log,
+              _raft->log_config().cache_enabled() ? ss::log_level::warn
+                                                  : ss::log_level::debug,
               "no progress has been made during state machine apply. Current "
               "next offset: {}",
               _next);

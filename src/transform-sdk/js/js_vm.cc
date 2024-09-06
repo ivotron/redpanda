@@ -19,11 +19,13 @@
 #include <sys/types.h>
 
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <expected>
 #include <format>
 #include <print>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -125,16 +127,40 @@ value value::array_buffer(JSContext* ctx, std::span<uint8_t> data) {
         ctx, data.data(), data.size(), func, opaque, /*is_shared=*/0)};
 }
 
+std::expected<value, exception>
+value::array_buffer_copy(JSContext* ctx, std::span<uint8_t> data) {
+    value val{ctx, JS_NewArrayBufferCopy(ctx, data.data(), data.size())};
+    if (val.is_exception()) {
+        return std::unexpected(exception::current(ctx));
+    }
+    return val;
+}
+
 value value::uint8_array(JSContext* ctx, std::span<uint8_t> data) {
     void* opaque = nullptr;
     // NOLINTNEXTLINE(*easily-swappable-parameters)
     JSFreeArrayBufferDataFunc* func = [](JSRuntime*, void* opaque, void* ptr) {
         // Nothing to do
     };
+
     return {
       ctx,
       JS_NewUint8Array(
         ctx, data.data(), data.size(), func, opaque, /*is_shared=*/0)};
+}
+
+// see quickjs source for detailed buffer ownership semantics
+// https://github.com/quickjs-ng/quickjs/blob/da5b95dcaf372dcc206019e171a0b08983683bf5/quickjs.c#L49379-L49436
+// TL;DR - With copying enabled, the array constructor registers a baked-in
+// free_func to be called by the object destructor. The copy of data is made
+// and mangaged internally to the quickjs runtime.
+std::expected<value, exception>
+value::uint8_array_copy(JSContext* ctx, std::span<uint8_t> data) {
+    value val{ctx, JS_NewUint8ArrayCopy(ctx, data.data(), data.size())};
+    if (val.is_exception()) {
+        return std::unexpected(exception::current(ctx));
+    }
+    return val;
 }
 
 void value::detach_buffer() {
@@ -181,6 +207,7 @@ value value::current_exception(JSContext* ctx) {
 }
 bool value::is_number() const { return JS_IsNumber(_underlying) != 0; }
 bool value::is_exception() const { return JS_IsException(_underlying) != 0; }
+bool value::is_error() const { return JS_IsError(_ctx, _underlying) != 0; }
 bool value::is_function() const {
     return JS_IsFunction(_ctx, _underlying) != 0;
 }
@@ -202,6 +229,11 @@ double value::as_number() const {
         return JS_VALUE_GET_FLOAT64(_underlying);
     }
     return JS_VALUE_GET_INT(_underlying);
+}
+
+int32_t value::as_integer() const {
+    auto num = as_number();
+    return static_cast<int32_t>(std::lround(num));
 }
 
 std::expected<value, exception> value::call(std::span<value> values) {
@@ -274,6 +306,7 @@ size_t value::array_length() const {
     return JS_VALUE_GET_INT(prop.raw());
 }
 
+// NOLINTNEXTLINE(*-no-recursion)
 std::string value::debug_string() const {
     if (is_null()) {
         return "null";
@@ -283,12 +316,18 @@ std::string value::debug_string() const {
     }
     size_t size = 0;
     const char* str = JS_ToCStringLen(_ctx, &size, _underlying);
+    std::string result;
     if (str != nullptr) {
-        auto result = std::string(str, size);
+        result = std::string(str, size);
         JS_FreeCString(_ctx, str);
-        return result;
+    } else {
+        result = "[exception]";
     }
-    return "[exception]";
+    if (is_exception() || is_error()) {
+        auto stack = get_property("stack");
+        result += std::format("\n Stack: \n{}", stack.debug_string());
+    }
+    return result;
 }
 
 bool operator==(const value& lhs, const value& rhs) {
@@ -394,6 +433,43 @@ private:
     FILE* _info_stream;
     FILE* _err_stream;
 };
+
+std::unordered_map<std::string, std::string> map_from_environ() {
+    std::unordered_map<std::string, std::string> env{};
+    for (char** envp = environ; *envp != nullptr;
+         std::advance(envp, std::ptrdiff_t{1})) {
+        // environ entries are expected to be null terminated
+        const std::string entry{*envp};
+        if (entry.empty()) {
+            continue;
+        }
+        auto delim = entry.find_first_of('=');
+        if (delim == std::string_view::npos) {
+            continue;
+        }
+        auto key = entry.substr(0, delim);
+        auto val = delim + 1 < entry.size() ? entry.substr(delim + 1) : "";
+        env.emplace(std::move(key), std::move(val));
+    }
+    env.try_emplace("NODE_ENV", "production");
+    return env;
+}
+
+std::expected<qjs::value, qjs::exception> env(JSContext* ctx) {
+    auto native_env = map_from_environ();
+    auto js_env = value::object(ctx);
+    for (const auto& [k, v] : native_env) {
+        auto val = value::string(ctx, v);
+        if (!val.has_value()) {
+            return std::unexpected(val.error());
+        }
+        if (auto res = js_env.set_property(k, val.value()); !res.has_value()) {
+            return std::unexpected(res.error());
+        }
+    }
+    return js_env;
+}
+
 } // namespace
 
 std::expected<std::monostate, exception> runtime::create_builtins() {
@@ -406,10 +482,29 @@ std::expected<std::monostate, exception> runtime::create_builtins() {
     console_builder.method<&console::warn>("error");
     auto factory = console_builder.build();
     auto global_this = value::global(_ctx.get());
-    return global_this.set_property(
+    auto result = global_this.set_property(
       "console",
       factory.create(std::make_unique<console>(
         console::config{.info = stdout, .warn = stderr})));
+
+    if (!result.has_value()) {
+        return result;
+    }
+
+    auto process = qjs::value::object(_ctx.get());
+    auto env_obj = env(_ctx.get());
+    if (!env_obj.has_value()) {
+        return std::unexpected(env_obj.error());
+    }
+    result = process.set_property("env", env_obj.value());
+    if (!result.has_value()) {
+        return result;
+    }
+    result = global_this.set_property("process", process);
+    if (!result.has_value()) {
+        return result;
+    }
+    return global_this.set_property("self", value::global(_ctx.get()));
 }
 
 std::expected<compiled_bytecode, exception>

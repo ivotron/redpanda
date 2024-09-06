@@ -46,7 +46,7 @@ struct diskcheck_opts
   : serde::
       envelope<diskcheck_opts, serde::version<0>, serde::compat_version<0>> {
     /// Descriptive name given to test run
-    ss::sstring name{"512K sequential r/w disk test"};
+    ss::sstring name{"unspecified"};
     /// Where files this benchmark will read/write to exist
     std::filesystem::path dir{config::node().disk_benchmark_path()};
     /// Open the file with O_DSYNC flag option
@@ -56,7 +56,7 @@ struct diskcheck_opts
     /// Set to true to disable the read portion of the benchmark
     bool skip_read{false};
     /// Total size of all benchmark files to exist on disk
-    uint64_t data_size{10ULL << 30}; // 1GiB
+    uint64_t data_size{10ULL << 30}; // 10GiB
     /// Size of individual read and/or write requests
     size_t request_size{512 << 10}; // 512KiB
     /// Total duration of the benchmark
@@ -239,9 +239,28 @@ struct cloudcheck_opts
     }
 };
 
+// Captures unparsed test types passed to self test backend.
+struct unparsed_check
+  : serde::
+      envelope<unparsed_check, serde::version<0>, serde::compat_version<0>> {
+    ss::sstring test_type;
+    ss::sstring test_json;
+    auto serde_fields() { return std::tie(test_type, test_json); }
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const unparsed_check& unparsed_check) {
+        fmt::print(
+          o,
+          "{{test_type: {}, test_json: {}}}",
+          unparsed_check.test_type,
+          unparsed_check.test_json);
+        return o;
+    }
+};
+
 struct self_test_result
   : serde::
-      envelope<self_test_result, serde::version<1>, serde::compat_version<1>> {
+      envelope<self_test_result, serde::version<1>, serde::compat_version<0>> {
     double p50{0};
     double p90{0};
     double p99{0};
@@ -289,25 +308,53 @@ struct self_test_result
           r.error ? *r.error : "<no_value>");
         return o;
     }
+
+    auto serde_fields() {
+        return std::tie(
+          p50,
+          p90,
+          p99,
+          p999,
+          max,
+          rps,
+          bps,
+          timeouts,
+          test_id,
+          name,
+          info,
+          test_type,
+          duration,
+          warning,
+          error,
+          start_time,
+          end_time);
+    }
 };
 
 struct empty_request
   : serde::
       envelope<empty_request, serde::version<0>, serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
+
+    auto serde_fields() { return std::tie(); }
 };
 
 struct start_test_request
   : serde::envelope<
       start_test_request,
-      serde::version<0>,
+      serde::version<2>,
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
 
     uuid_t id;
     std::vector<diskcheck_opts> dtos;
     std::vector<netcheck_opts> ntos;
+    std::vector<unparsed_check> unparsed_checks;
     std::vector<cloudcheck_opts> ctos;
+
+    auto serde_fields() {
+        return std::tie(id, dtos, ntos, unparsed_checks, ctos);
+    }
 
     friend std::ostream&
     operator<<(std::ostream& o, const start_test_request& r) {
@@ -321,6 +368,9 @@ struct start_test_request
         for (const auto& v : r.ctos) {
             fmt::print(ss, "cloudcheck_opts: {}", v);
         }
+        for (const auto& v : r.unparsed_checks) {
+            fmt::print(ss, "unparsed_check: {}", v);
+        }
         fmt::print(o, "{{id: {} {}}}", r.id, ss.str());
         return o;
     }
@@ -329,14 +379,16 @@ struct start_test_request
 struct get_status_response
   : serde::envelope<
       get_status_response,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
 
     uuid_t id{};
     self_test_status status{};
-    self_test_stage stage{};
     std::vector<self_test_result> results;
+    self_test_stage stage{};
+
+    auto serde_fields() { return std::tie(id, status, results, stage); }
 
     friend std::ostream&
     operator<<(std::ostream& o, const get_status_response& r) {
@@ -357,6 +409,7 @@ struct netcheck_request
     using rpc_adl_exempt = std::true_type;
     model::node_id source;
     iobuf buf;
+    auto serde_fields() { return std::tie(source, buf); }
     friend std::ostream&
     operator<<(std::ostream& o, const netcheck_request& r) {
         fmt::print(o, "{{source: {} buf: {}}}", r.source, r.buf.size_bytes());
@@ -369,6 +422,9 @@ struct netcheck_response
       envelope<netcheck_response, serde::version<0>, serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
     size_t bytes_read{0};
+
+    auto serde_fields() { return std::tie(bytes_read); }
+
     friend std::ostream&
     operator<<(std::ostream& o, const netcheck_response& r) {
         fmt::print(o, "{{bytes_read: {}}}", r.bytes_read);
@@ -380,5 +436,14 @@ struct netcheck_response
 /// buffer will be split into fragments of 8192 bytes each.
 ss::future<cluster::netcheck_request>
 make_netcheck_request(model::node_id src, size_t sz);
+
+// Parses the raw json out of the start_test_request::unparsed_checks vector
+// into self-test options for the various tests, utilizing `opt_t::from_json`.
+// In the case that the controller node is of a redpanda version lower than
+// the current node, some self-test checks may have been left in
+// the "unparsed_checks" vector in the request when the server first processes
+// the self test request. We will attempt to parse the test json in the
+// self_test_backend of the follower node instead, if we recognize it.
+void parse_self_test_checks(start_test_request& r);
 
 } // namespace cluster

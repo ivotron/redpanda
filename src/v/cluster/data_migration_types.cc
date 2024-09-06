@@ -40,26 +40,9 @@ inbound_migration inbound_migration::copy() const {
     return inbound_migration{.topics = topics.copy(), .groups = groups.copy()};
 }
 
-std::optional<state> inbound_migration::next_replica_state(state state) {
-    if (state == state::preparing) {
-        return state::prepared;
-    };
-    return std::nullopt;
-}
-
 outbound_migration outbound_migration::copy() const {
     return outbound_migration{
       .topics = topics.copy(), .groups = groups.copy(), .copy_to = copy_to};
-}
-
-std::optional<state> outbound_migration::next_replica_state(state state) {
-    if (state == state::preparing) {
-        return state::prepared;
-    };
-    if (state == state::executing) {
-        return state::executed;
-    };
-    return std::nullopt;
 }
 
 std::ostream& operator<<(std::ostream& o, state state) {
@@ -74,6 +57,8 @@ std::ostream& operator<<(std::ostream& o, state state) {
         return o << "executing";
     case state::executed:
         return o << "executed";
+    case state::cut_over:
+        return o << "cut_over";
     case state::finished:
         return o << "finished";
     case state::canceling:
@@ -97,11 +82,13 @@ std::ostream& operator<<(std::ostream& o, migrated_replica_status status) {
 std::ostream& operator<<(std::ostream& o, migrated_resource_state state) {
     switch (state) {
     case migrated_resource_state::non_restricted:
-        return o << "non-restricted";
-    case migrated_resource_state::restricted:
+        return o << "non_restricted";
+    case migrated_resource_state::metadata_locked:
         return o << "restricted";
-    case migrated_resource_state::blocked:
-        return o << "blocked";
+    case migrated_resource_state::read_only:
+        return o << "read_only";
+    case migrated_resource_state::fully_blocked:
+        return o << "fully_blocked";
     }
 }
 
@@ -141,14 +128,6 @@ std::ostream& operator<<(std::ostream& o, const outbound_migration& dm) {
       fmt::join(dm.groups, ", "),
       dm.copy_to);
     return o;
-}
-
-std::optional<state> migration_metadata::next_replica_state() const {
-    return std::visit(
-      [this](const auto& migration) {
-          return migration.next_replica_state(state);
-      },
-      migration);
 }
 
 std::ostream& operator<<(std::ostream& o, const migration_metadata& m) {

@@ -78,10 +78,10 @@ maybe_disable_cow(const std::filesystem::path& path, ss::file& file) {
                 vlog(stlog.trace, "Disabled COW on BTRFS segment {}", path);
             }
         }
-    } catch (std::filesystem::filesystem_error& e) {
+    } catch (const std::filesystem::filesystem_error& e) {
         // This can happen if e.g. our file open races with an unlink
         vlog(stlog.info, "Filesystem error disabling COW on {}: {}", path, e);
-    } catch (std::system_error& e) {
+    } catch (const std::system_error& e) {
         // Non-fatal, user will just get degraded behaviour
         // when btrfs tries to COW on a journal.
         vlog(stlog.info, "System error disabling COW on {}: {}", path, e);
@@ -305,7 +305,7 @@ do_detect_compaction_index_state(segment_full_path p, compaction_config cfg) {
     return make_reader_handle(p, cfg.sanitizer_config)
       .then([cfg, p](ss::file f) {
           return make_file_backed_compacted_reader(
-            p, std::move(f), cfg.iopc, 64_KiB);
+            p, std::move(f), cfg.iopc, 64_KiB, cfg.asrc);
       })
       .then([](compacted_index_reader reader) {
           return reader.verify_integrity()
@@ -363,7 +363,7 @@ ss::future<> do_compact_segment_index(
     return make_reader_handle(compacted_path, cfg.sanitizer_config)
       .then([cfg, compacted_path, s, &resources](ss::file f) {
           auto reader = make_file_backed_compacted_reader(
-            compacted_path, std::move(f), cfg.iopc, 64_KiB);
+            compacted_path, std::move(f), cfg.iopc, 64_KiB, cfg.asrc);
           return write_clean_compacted_index(reader, cfg, resources);
       });
 }
@@ -385,7 +385,8 @@ ss::future<storage::index_state> do_copy_segment_data(
       idx_path,
       co_await make_reader_handle(idx_path, cfg.sanitizer_config),
       cfg.iopc,
-      64_KiB);
+      64_KiB,
+      cfg.asrc);
     auto compacted_offsets
       = co_await generate_compacted_list(
           seg->offsets().get_base_offset(), compacted_reader)
@@ -428,7 +429,10 @@ ss::future<storage::index_state> do_copy_segment_data(
       appender.get(),
       seg->path().is_internal_topic(),
       apply_offset,
-      segment_last_offset);
+      segment_last_offset,
+      /*cidx=*/nullptr,
+      /*inject_failure=*/false,
+      cfg.asrc);
 
     // create the segment, get the in-memory index for the new segment
     auto new_index = co_await create_segment_full_reader(
@@ -511,6 +515,10 @@ ss::future<std::optional<size_t>> do_self_compact_segment(
   offset_delta_time apply_offset,
   ss::rwlock::holder read_holder,
   ss::sharded<features::feature_table>& feature_table) {
+    if (cfg.asrc) {
+        cfg.asrc->check();
+    }
+
     vlog(gclog.trace, "self compacting segment {}", s->reader().path());
     auto segment_generation = s->get_generation_id();
 
@@ -526,6 +534,10 @@ ss::future<std::optional<size_t>> do_self_compact_segment(
     auto staging_file = s->reader().path().to_staging();
     auto staging_to_clean = scoped_file_tracker{
       cfg.files_to_cleanup, {staging_file}};
+    // check the abort source after compacting segment index
+    if (cfg.asrc) {
+        cfg.asrc->check();
+    }
     auto idx = co_await do_copy_segment_data(
       s,
       cfg,
@@ -534,6 +546,8 @@ ss::future<std::optional<size_t>> do_self_compact_segment(
       resources,
       apply_offset,
       feature_table);
+    vlog(
+      gclog.trace, "finished copying segment data for {}", s->reader().path());
 
     auto rdr_holder = co_await readers_cache.evict_segment_readers(s);
 
@@ -835,21 +849,23 @@ make_concatenated_segment(
 ss::future<std::vector<compacted_index_reader>> make_indices_readers(
   std::vector<ss::lw_shared_ptr<segment>>& segments,
   ss::io_priority_class io_pc,
-  std::optional<ntp_sanitizer_config> ntp_sanitizer_config) {
+  std::optional<ntp_sanitizer_config> ntp_sanitizer_config,
+  ss::abort_source* as) {
     return ssx::async_transform(
       segments.begin(),
       segments.end(),
-      [io_pc, san_cfg = ntp_sanitizer_config](ss::lw_shared_ptr<segment>& seg) {
+      [io_pc, san_cfg = ntp_sanitizer_config, as](
+        ss::lw_shared_ptr<segment>& seg) {
           const auto path = seg->reader().path().to_compacted_index();
           auto f = ss::now();
           if (seg->has_compaction_index()) {
               f = seg->compaction_index().close();
           }
-          return f.then([io_pc, san_cfg, path]() mutable {
+          return f.then([io_pc, san_cfg, path, as]() mutable {
               return make_reader_handle(path, std::move(san_cfg))
-                .then([path, io_pc](auto reader_fd) {
+                .then([path, io_pc, as](auto reader_fd) {
                     return make_file_backed_compacted_reader(
-                      path, reader_fd, io_pc, 64_KiB);
+                      path, reader_fd, io_pc, 64_KiB, as);
                 });
           });
       });
@@ -882,7 +898,8 @@ ss::future<> do_write_concatenated_compacted_index(
   std::vector<ss::lw_shared_ptr<segment>>& segments,
   compaction_config cfg,
   storage_resources& resources) {
-    return make_indices_readers(segments, cfg.iopc, cfg.sanitizer_config)
+    return make_indices_readers(
+             segments, cfg.iopc, cfg.sanitizer_config, cfg.asrc)
       .then([cfg, target_path = std::move(target_path), &resources](
               std::vector<compacted_index_reader> readers) mutable {
           vlog(gclog.debug, "concatenating {} indicies", readers.size());
@@ -1000,7 +1017,7 @@ ss::future<std::vector<ss::rwlock::holder>> write_lock_segments(
             }
             held = co_await ss::when_all_succeed(held_f.begin(), held_f.end());
             break;
-        } catch (ss::semaphore_timed_out&) {
+        } catch (const ss::semaphore_timed_out&) {
             held.clear();
         }
         if (retries == 0) {

@@ -92,6 +92,8 @@ namespace model {
 using node_uuid = named_type<uuid_t, struct node_uuid_type>;
 using cluster_uuid = named_type<uuid_t, struct cluster_uuid_type>;
 
+static constexpr cluster_uuid default_cluster_uuid{};
+
 using node_id = named_type<int32_t, struct node_id_model_type>;
 
 /**
@@ -146,6 +148,16 @@ operator&(cleanup_policy_bitflags a, cleanup_policy_bitflags b) {
 
 inline void operator&=(cleanup_policy_bitflags& a, cleanup_policy_bitflags b) {
     a = (a & b);
+}
+
+inline bool is_compaction_enabled(cleanup_policy_bitflags flags) {
+    return (flags & cleanup_policy_bitflags::compaction)
+           == cleanup_policy_bitflags::compaction;
+}
+
+inline bool is_deletion_enabled(cleanup_policy_bitflags flags) {
+    return (flags & cleanup_policy_bitflags::deletion)
+           == cleanup_policy_bitflags::deletion;
 }
 
 std::ostream& operator<<(std::ostream&, cleanup_policy_bitflags);

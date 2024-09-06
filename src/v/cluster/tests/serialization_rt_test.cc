@@ -25,6 +25,7 @@
 #include "model/tests/random_batch.h"
 #include "model/tests/randoms.h"
 #include "model/timestamp.h"
+#include "pandaproxy/schema_registry/test/random.h"
 #include "raft/fundamental.h"
 #include "raft/group_configuration.h"
 #include "raft/types.h"
@@ -747,7 +748,6 @@ cluster::cluster_health_report random_cluster_health_report() {
           tests::random_named_int<model::node_id>(),
           random_local_state(),
           std::move(topics),
-          /*include_drain_status=*/true,
           random_drain_status());
 
         // Reduce to an ADL-encodable state
@@ -794,7 +794,7 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
       tests::random_named_int<model::term_id>(),
       tests::random_named_int<model::node_id>(),
       tests::random_named_int<model::revision_id>()));
-    fragmented_vector<cluster::ntp_leader_revision> l_revs;
+    chunked_vector<cluster::ntp_leader_revision> l_revs;
     l_revs.emplace_back(
       model::random_ntp(),
       tests::random_named_int<model::term_id>(),
@@ -1598,14 +1598,13 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
           tests::random_named_int<model::node_id>(),
           random_local_state(),
           std::move(topics),
-          true,
           random_drain_status());
 
         // Squash local_state to a form that ADL represents, since we will
         // test ADL roundtrip.
         data.local_state.cache_disk = std::nullopt;
 
-        roundtrip_test(data);
+        roundtrip_test(cluster::node_health_report_serde{data});
     }
     {
         chunked_vector<cluster::topic_status> topics;
@@ -1616,20 +1615,20 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
           tests::random_named_int<model::node_id>(),
           random_local_state(),
           std::move(topics),
-          true,
           random_drain_status());
 
         // Squash to ADL-understood disk state
         report.local_state.cache_disk = report.local_state.data_disk;
 
-        cluster::get_node_health_reply data{
-          .report = report,
-        };
-        roundtrip_test(data);
+        roundtrip_test(cluster::get_node_health_reply{
+          .report = cluster::node_health_report_serde{report},
+        });
         // try serde with non-default error code. adl doesn't encode error so
         // this is a serde only test.
-        data.error = cluster::errc::error_collecting_health_report;
-        roundtrip_test(data);
+        roundtrip_test(cluster::get_node_health_reply{
+          .error = cluster::errc::error_collecting_health_report,
+          .report = cluster::node_health_report_serde{report},
+        });
     }
     {
         std::vector<model::node_id> nodes;
@@ -2030,9 +2029,9 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
     {
         // Test schema ID validation topic_create
         auto key_validation = tests::random_bool();
-        auto key_strategy = model::random_subject_name_strategy();
+        auto key_strategy = tests::random_subject_name_strategy();
         auto val_validation = tests::random_bool();
-        auto val_strategy = model::random_subject_name_strategy();
+        auto val_strategy = tests::random_subject_name_strategy();
 
         cluster::topic_properties props{};
 
@@ -2058,9 +2057,9 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
     {
         // Test schema ID validation incremental_topic_updates
         auto key_validation = tests::random_bool();
-        auto key_strategy = model::random_subject_name_strategy();
+        auto key_strategy = tests::random_subject_name_strategy();
         auto val_validation = tests::random_bool();
-        auto val_strategy = model::random_subject_name_strategy();
+        auto val_strategy = tests::random_subject_name_strategy();
 
         cluster::incremental_topic_updates updates{
           .record_key_schema_id_validation = random_property_update(

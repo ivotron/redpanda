@@ -74,8 +74,16 @@ TEST_F(raft_fixture, test_empty_writes) {
     auto reader = model::make_memory_record_batch_reader(
       std::move(builder).build());
 
-    EXPECT_DEATH(
-      replicate(std::move(reader)).get(), "Assert failure.+Empty batch");
+    // Catch the error when appending.
+    auto res = replicate(std::move(reader)).get();
+    ASSERT_TRUE(res.has_error());
+    ASSERT_EQ(res.error(), errc::leader_append_failed);
+
+    // In this case there are no batches at all so we don't go to storage, and
+    // catch the error in Raft.
+    res = replicate(make_batches({})).get();
+    ASSERT_TRUE(res.has_error());
+    ASSERT_EQ(res.error(), errc::invalid_input_records);
 }
 
 TEST_F_CORO(raft_fixture, test_stuck_append_entries) {
@@ -820,11 +828,11 @@ TEST_F_CORO(raft_fixture, leadership_transfer_delay) {
         co_await stop_node(vn.id());
     }
 
-    auto tolerance = 0.15;
+    auto tolerance_multiplier = 1.3;
     /**
-     * Validate that election time  after reconfiguration is simillar to the
+     * Validate that election time after reconfiguration is simillar to the
      * time needed for leadership transfer
      */
-    ASSERT_LE_CORO(election_time, transfer_time * (1.0 + tolerance));
-    ASSERT_GE_CORO(election_time, transfer_time * (1.0 - tolerance));
+    ASSERT_LE_CORO(election_time * 1.0, transfer_time * tolerance_multiplier);
+    ASSERT_GE_CORO(election_time * 1.0, transfer_time / tolerance_multiplier);
 }

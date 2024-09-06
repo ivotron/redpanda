@@ -64,10 +64,13 @@ namespace cluster {
  *
  * 2. Idempotent requests - Provides single session idempotency guarantees. Each
  * idempotent produce request is associated with a producer_identity
- * (producer_id + epoch=0). Idempotency is implemented by tracking sequence
+ * (producer_id + epoch=N). Idempotency is implemented by tracking sequence
  * numbers of last 5 inflight/processed requests and ensuring that the new
  * requests maintain the sequence order. Client stamps the record batches with
- * sequence numbers.
+ * sequence numbers. Idempotent producer may choose to increment epoch on the
+ * client side to reset the sequence tracking when it deems safe
+ * (check kip-360). The state machine detects such situations and resets the
+ * tracked sequence number state.
  *
  * 3. Transactional requests - Provides EOS semantics across multiple sessions
  * by implementing fencing as defined in the Kafka protocol. Transactional
@@ -230,7 +233,13 @@ private:
     ss::future<> do_remove_persistent_state();
     ss::future<fragmented_vector<tx::tx_range>>
       do_aborted_transactions(model::offset, model::offset);
-    tx::producer_ptr maybe_create_producer(model::producer_identity);
+
+    // Tells whether the producer is already known or is created
+    // for the first time from the incoming request.
+    using producer_previously_known
+      = ss::bool_class<struct new_producer_created_tag>;
+    std::pair<tx::producer_ptr, producer_previously_known>
+      maybe_create_producer(model::producer_identity);
     void cleanup_producer_state(model::producer_identity);
     ss::future<> reset_producers();
     ss::future<checked<model::term_id, tx::errc>> do_begin_tx(
@@ -252,8 +261,10 @@ private:
       model::timeout_clock::duration);
     ss::future<>
     apply_local_snapshot(raft::stm_snapshot_header, iobuf&&) override;
-    ss::future<raft::stm_snapshot> take_local_snapshot() override;
-    ss::future<raft::stm_snapshot> do_take_local_snapshot(uint8_t version);
+    ss::future<raft::stm_snapshot>
+    take_local_snapshot(ssx::semaphore_units apply_units) override;
+    ss::future<raft::stm_snapshot>
+    do_take_local_snapshot(uint8_t version, ssx::semaphore_units apply_units);
     ss::future<std::optional<tx::abort_snapshot>>
       load_abort_snapshot(tx::abort_index);
     ss::future<> save_abort_snapshot(tx::abort_snapshot);
@@ -292,7 +303,8 @@ private:
       model::record_batch_reader,
       raft::replicate_options,
       ss::lw_shared_ptr<available_promise<>>,
-      ssx::semaphore_units&);
+      ssx::semaphore_units&,
+      producer_previously_known);
 
     ss::future<result<kafka_result>> idempotent_replicate(
       model::term_id,
@@ -301,7 +313,8 @@ private:
       model::record_batch_reader,
       raft::replicate_options,
       ss::lw_shared_ptr<available_promise<>>,
-      ssx::semaphore_units);
+      ssx::semaphore_units,
+      producer_previously_known);
 
     ss::future<result<kafka_result>> replicate_msg(
       model::record_batch_reader,
@@ -319,13 +332,12 @@ private:
 
     abort_origin get_abort_origin(tx::producer_ptr, model::tx_seq) const;
 
-    ss::future<> apply(const model::record_batch&) override;
+    ss::future<> do_apply(const model::record_batch&) override;
     void apply_fence(model::producer_identity, model::record_batch);
     void apply_control(model::producer_identity, model::control_record_type);
     void apply_data(model::batch_identity, const model::record_batch_header&);
 
     ss::future<> reduce_aborted_list();
-    ss::future<> offload_aborted_txns();
 
     /**
      * Return when the committed offset has been established when STM starts.

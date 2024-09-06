@@ -163,12 +163,12 @@ struct state_machine_fixture : raft_fixture {
             builder.add_raw_kv(serde::to_iobuf(k), serde::to_iobuf(v));
         }
 
-        co_return co_await with_leader(
-          5s,
+        co_return co_await retry_with_leader(
+          10s + model::timeout_clock::now(),
           [b = std::move(builder).build()](
             raft_node_instance& leader_node) mutable {
               return leader_node.raft()->replicate(
-                model::make_memory_record_batch_reader(std::move(b)),
+                model::make_memory_record_batch_reader(b.share()),
                 raft::replicate_options(raft::consistency_level::quorum_ack));
           });
     }
@@ -215,10 +215,17 @@ struct state_machine_fixture : raft_fixture {
             i += batch_sz;
 
             auto result = co_await replicate(std::move(ops));
-            vlog(
-              logger().debug,
-              "replication result: [last_offset: {}]",
-              result.value().last_offset);
+            if (result.has_value()) {
+                vlog(
+                  logger().debug,
+                  "replication result: [last_offset: {}]",
+                  result.value().last_offset);
+            } else {
+                auto error = result.error();
+                vlog(logger().warn, "replication failure: {}", error);
+                throw std::runtime_error(
+                  fmt::format("replication failure {}", error));
+            }
 
             if (wait_for_each) {
                 co_await wait_for_apply();

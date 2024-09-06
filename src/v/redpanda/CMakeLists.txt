@@ -32,7 +32,7 @@ endforeach()
 v_cc_library(
   NAME clientutil
   SRCS
-    cluster_config_schema_util.cc
+    admin/cluster_config_schema_util.cc
     ${cluster_config_swagger_files}
   DEPS
     v::config
@@ -42,7 +42,7 @@ v_cc_library(
   NAME application
   SRCS
     ${swag_files}
-    cluster_config_schema_util.cc
+    admin/cluster_config_schema_util.cc
     admin/server.cc
     admin/debug.cc
     admin/transform.cc
@@ -54,6 +54,8 @@ v_cc_library(
     admin/kafka.cc
     admin/util.cc
     admin/migrations.cc
+    admin/topics.cc
+    admin/data_migration_utils.cc
     cli_parser.cc
     application.cc
     monitor_unsafe_log_flag.cc

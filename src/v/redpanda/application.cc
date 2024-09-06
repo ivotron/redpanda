@@ -9,17 +9,21 @@
 
 #include "redpanda/application.h"
 
-#include "archival/archival_metadata_stm.h"
-#include "archival/archiver_manager.h"
-#include "archival/ntp_archiver_service.h"
-#include "archival/purger.h"
-#include "archival/upload_controller.h"
-#include "archival/upload_housekeeping_service.h"
 #include "base/vlog.h"
 #include "cli_parser.h"
 #include "cloud_storage/cache_service.h"
+#include "cloud_storage/configuration.h"
+#include "cloud_storage/inventory/inv_ops.h"
+#include "cloud_storage/inventory/types.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage_clients/client_pool.h"
+#include "cloud_storage_clients/configuration.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/archiver_manager.h"
+#include "cluster/archival/ntp_archiver_service.h"
+#include "cluster/archival/purger.h"
+#include "cluster/archival/upload_controller.h"
+#include "cluster/archival/upload_housekeeping_service.h"
 #include "cluster/bootstrap_service.h"
 #include "cluster/cloud_metadata/offsets_lookup.h"
 #include "cluster/cloud_metadata/offsets_recoverer.h"
@@ -41,6 +45,7 @@
 #include "cluster/id_allocator.h"
 #include "cluster/id_allocator_frontend.h"
 #include "cluster/id_allocator_stm.h"
+#include "cluster/inventory_service.h"
 #include "cluster/log_eviction_stm.h"
 #include "cluster/members_manager.h"
 #include "cluster/members_table.h"
@@ -61,7 +66,6 @@
 #include "cluster/self_test_rpc_handler.h"
 #include "cluster/service.h"
 #include "cluster/tm_stm.h"
-#include "cluster/tm_stm_cache_manager.h"
 #include "cluster/topic_recovery_service.h"
 #include "cluster/topic_recovery_status_frontend.h"
 #include "cluster/topic_recovery_status_rpc_handler.h"
@@ -129,9 +133,10 @@
 #include "utils/file_io.h"
 #include "utils/human.h"
 #include "utils/uuid.h"
-#include "version.h"
-#include "wasm/api.h"
+#include "version/version.h"
 #include "wasm/cache.h"
+#include "wasm/engine.h"
+#include "wasm/impl.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/memory.hh>
@@ -148,6 +153,14 @@
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
+#include <absl/log/globals.h>
+#include <fmt/format.h>
+#if __has_include(<google/protobuf/runtime_version.h>)
+#include <google/protobuf/runtime_version.h>
+#endif
+#if __has_include(<google/protobuf/stubs/logging.h>)
+#include <google/protobuf/stubs/logging.h>
+#endif
 #include <sys/resource.h>
 #include <sys/utsname.h>
 
@@ -424,8 +437,12 @@ int application::run(int ac, char** av) {
     // use endl for explicit flushing
     std::cout << community_msg << std::endl;
 
-    return app.run(ac, av, [this, &app] {
+    std::string cmd_line = fmt::to_string(
+      fmt::join(std::span{av, size_t(ac)}, " "));
+
+    return app.run(ac, av, [this, &app, cmd_line = std::move(cmd_line)] {
         vlog(_log.info, "Redpanda {}", redpanda_version());
+        vlog(_log.info, "Command line: {}", cmd_line);
         struct ::utsname buf;
         ::uname(&buf);
         vlog(
@@ -479,6 +496,8 @@ int application::run(int ac, char** av) {
     });
 }
 
+static void apply_io_sink_hack(ss::logger& log);
+
 void application::initialize(
   std::optional<YAML::Node> proxy_cfg,
   std::optional<YAML::Node> proxy_client_cfg,
@@ -526,14 +545,27 @@ void application::initialize(
       .get();
     _cpu_profiler.invoke_on_all(&resources::cpu_profiler::start).get();
 
+    ss::smp::invoke_on_all([this] { apply_io_sink_hack(_log); }).get();
+
+    /*
+     * Disable the logger for protobuf; some interfaces don't allow a pluggable
+     * error collector.
+     */
+#if PROTOBUF_VERSION < 5027000
+    google::protobuf::SetLogHandler(nullptr);
+#else
+    // Protobuf uses absl logging in the latest version
+    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfinity);
+#endif
+
     /*
      * allocate per-core zstd decompression workspace and per-core
-     * async_stream_zstd workspaces. it can be several megabytes in size, so do
-     * it before memory becomes fragmented.
+     * async_stream_zstd workspaces. it can be several megabytes in size, so
+     * do it before memory becomes fragmented.
      */
     ss::smp::invoke_on_all([] {
-        // TODO: remove this when stream_zstd is replaced with async_stream_zstd
-        // in v/kafka
+        // TODO: remove this when stream_zstd is replaced with
+        // async_stream_zstd in v/kafka
         compression::stream_zstd::init_workspace(
           config::shard_local_cfg().zstd_decompress_workspace_bytes());
 
@@ -1253,6 +1285,49 @@ make_upload_controller_config(ss::scheduling_group sg) {
       config::shard_local_cfg().cloud_storage_upload_ctrl_max_shares()};
 }
 
+// machinery to safely access private members
+// http://bloglitb.blogspot.com/2010/07/access-to-private-members-thats-easy.html
+namespace seastar::internal {
+template<typename Tag, typename Tag::type M>
+struct rob {
+    friend typename Tag::type get(Tag) { return M; }
+};
+
+struct io_sink_get {
+    using type = io_sink reactor::*;
+    friend type get(io_sink_get);
+};
+
+struct pending_get {
+    using type = circular_buffer<pending_io_request> io_sink::*;
+    friend type get(pending_get);
+};
+
+template struct rob<io_sink_get, &reactor::_io_sink>;
+template struct rob<pending_get, &internal::io_sink::_pending_io>;
+} // namespace seastar::internal
+
+static void apply_io_sink_hack(ss::logger& log) {
+    // The reactor has a reactor::_io_sink::_io_pending buffer which holds
+    // pending IOs after they have been drained from the io queues, and in
+    // some cases this can get very large, causing a large allocation.
+    // While we pursue a longer-term solution, we work around this by reserving
+    // a large number of elements at startup, which avoids the need to grow the
+    // array later as long as we stay below that number.
+    // See CORE-6814, CORE-2956
+    // https://github.com/scylladb/seastar/pull/2357
+    auto& io_sink = ss::engine().*get(ss::internal::io_sink_get());
+    auto& pending = io_sink.*get(ss::internal::pending_get());
+
+    static constexpr size_t initial_pending_io_size = 10000;
+    pending.reserve(initial_pending_io_size);
+
+    vlog(
+      log.info0,
+      "CORE-6814 applied: io_sink capacity >= {}",
+      initial_pending_io_size);
+}
+
 // add additional services in here
 void application::wire_up_runtime_services(
   model::node_id node_id, ::stop_signal& app_signal) {
@@ -1284,7 +1359,7 @@ void application::wire_up_runtime_services(
 
     if (wasm_data_transforms_enabled()) {
         syschecks::systemd_message("Starting wasm runtime").get();
-        auto base_runtime = wasm::runtime::create_default(
+        auto base_runtime = wasm::create_default_runtime(
           _schema_registry.get());
         construct_single_service(_wasm_runtime, std::move(base_runtime));
 
@@ -1444,6 +1519,8 @@ void application::wire_up_redpanda_services(
         recovery_throttle.stop().get();
     });
 
+    model::cloud_storage_backend backend{model::cloud_storage_backend::unknown};
+    cloud_storage_clients::bucket_name bucket{};
     if (archival_storage_enabled()) {
         syschecks::systemd_message("Starting cloud storage api").get();
         ss::sharded<cloud_storage::configuration> cloud_configs;
@@ -1456,6 +1533,10 @@ void application::wire_up_redpanda_services(
                 [&c](cloud_storage::configuration cfg) { c = std::move(cfg); });
           })
           .get();
+        backend = cloud_storage_clients::infer_backend_from_configuration(
+          cloud_configs.local().client_config,
+          cloud_configs.local().cloud_credentials_source);
+        bucket = cloud_configs.local().bucket_name;
         construct_service(
           cloud_storage_clients,
           cloud_configs.local().connection_limit,
@@ -1506,17 +1587,16 @@ void application::wire_up_redpanda_services(
           .get();
     }
 
-    syschecks::systemd_message("Creating tm_stm_cache_manager").get();
-
-    construct_service(tm_stm_cache_manager).get();
-
     syschecks::systemd_message("Initializing producer state manager").get();
     construct_service(
       producer_manager,
       ss::sharded_parameter([]() {
           return config::shard_local_cfg().max_concurrent_producer_ids.bind();
       }),
-      config::shard_local_cfg().transactional_id_expiration_ms.value(),
+      ss::sharded_parameter([]() {
+          return config::shard_local_cfg()
+            .transactional_id_expiration_ms.bind();
+      }),
       ss::sharded_parameter([]() {
           return config::shard_local_cfg()
             .virtual_cluster_min_producer_ids.bind();
@@ -1705,6 +1785,7 @@ void application::wire_up_redpanda_services(
     construct_service(
       metadata_cache,
       std::ref(controller->get_topics_state()),
+      std::ref(controller->get_data_migrated_resources()),
       std::ref(controller->get_members_table()),
       std::ref(controller->get_partition_leaders()),
       std::ref(controller->get_health_monitor()))
@@ -1815,6 +1896,60 @@ void application::wire_up_redpanda_services(
                   topic_recovery_status_frontend, topic_recovery_service);
             })
           .get();
+
+        if (
+          config::shard_local_cfg()
+            .cloud_storage_inventory_based_scrub_enabled()
+          && config::shard_local_cfg().cloud_storage_enable_scrubbing()) {
+            const auto manual_setup
+              = config::shard_local_cfg()
+                  .cloud_storage_inventory_self_managed_report_config();
+            const auto supported = cloud_storage::inventory::
+              validate_backend_supported_for_inventory_scrub(backend);
+            if (!manual_setup && !supported) {
+                throw std::runtime_error(fmt::format(
+                  "cloud storage backend inferred as {} which is "
+                  "not supported for inventory based scrubbing",
+                  backend));
+            }
+
+            std::shared_ptr<cluster::leaders_provider> leaders_provider
+              = std::make_shared<cluster::default_leaders_provider>(
+                controller->get_partition_leaders());
+            std::shared_ptr<cluster::remote_provider> remote_provider
+              = std::make_shared<cluster::default_remote_provider>(
+                cloud_storage_api);
+            auto inv_ops
+              = cloud_storage::inventory::make_inv_ops(
+                  bucket,
+                  cloud_storage::inventory::inventory_config_id{
+                    config::shard_local_cfg().cloud_storage_inventory_id()},
+                  config::shard_local_cfg()
+                    .cloud_storage_inventory_reports_prefix())
+                  .get();
+            const auto report_check_interval
+              = config::shard_local_cfg()
+                  .cloud_storage_inventory_report_check_interval_ms();
+            // If the self-managed flag is enabled, do not create report
+            // schedule
+            const auto should_create_report_config
+              = !config::shard_local_cfg()
+                   .cloud_storage_inventory_self_managed_report_config();
+            construct_single_service_sharded(
+              inventory_service,
+              config::node().cloud_storage_inventory_hash_path(),
+              leaders_provider,
+              remote_provider,
+              std::move(inv_ops),
+              report_check_interval,
+              should_create_report_config)
+              .get();
+            inventory_service
+              .invoke_on(
+                cluster::inventory_service::shard_id,
+                &cluster::inventory_service::start)
+              .get();
+        }
     }
 
     construct_single_service(
@@ -1973,12 +2108,11 @@ void application::wire_up_redpanda_services(
       std::ref(metadata_cache),
       std::ref(_connection_cache),
       std::ref(controller->get_partition_leaders()),
-      controller.get(),
+      node_id,
       std::ref(id_allocator_frontend),
       _rm_group_proxy.get(),
       std::ref(rm_partition_frontend),
       std::ref(feature_table),
-      std::ref(tm_stm_cache_manager),
       std::ref(tx_topic_manager),
       ss::sharded_parameter([] {
           return config::shard_local_cfg()
@@ -2668,8 +2802,7 @@ void application::start_runtime_services(
     syschecks::systemd_message("Starting the partition manager").get();
     partition_manager
       .invoke_on_all([this](cluster::partition_manager& pm) {
-          pm.register_factory<cluster::tm_stm_factory>(
-            tm_stm_cache_manager, feature_table);
+          pm.register_factory<cluster::tm_stm_factory>(feature_table);
           pm.register_factory<cluster::id_allocator_stm_factory>();
           pm.register_factory<transform::transform_offsets_stm_factory>(
             controller->get_topics_state());

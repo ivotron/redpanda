@@ -46,6 +46,7 @@
 #include "rpc/errc.h"
 #include "rpc/types.h"
 #include "ssx/future-util.h"
+#include "topic_configuration.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -126,25 +127,24 @@ ss::future<std::vector<topic_result>> topics_frontend::create_topics(
   model::timeout_clock::time_point timeout) {
     for (auto& tp : topics) {
         /**
+         * The shadow_indexing properties
+         * ('redpanda.remote.(read|write|delete)') are special "sticky" topic
+         * properties that are always set as a topic-level override.
+         *
+         * See: https://github.com/redpanda-data/redpanda/issues/7451
+         *
          * Note that a manually created topic will have this assigned already by
          * kafka/server/handlers/topics/types.cc::to_cluster_type, dependent on
          * client-provided topic properties.
+         *
+         * tp.cfg.properties.remote_delete is stored as a bool (not
+         * std::optional<bool>) defaulted to its default value
+         * (ntp_config::default_remote_delete) on the construction of
+         * topic_properties(), so there is no need to overwrite it here.
          */
         if (!tp.cfg.properties.shadow_indexing.has_value()) {
             tp.cfg.properties.shadow_indexing
               = _metadata_cache.get_default_shadow_indexing_mode();
-        }
-
-        /**
-         * We always override cleanup policy. i.e. topic cleanup policy will
-         * stay the same even if it was changed in defaults (broker
-         * configuration) and there was no override passed by client while
-         * creating a topic. The the same policy is applied in Kafka.
-         */
-
-        if (!tp.cfg.properties.cleanup_policy_bitflags.has_value()) {
-            tp.cfg.properties.cleanup_policy_bitflags
-              = _metadata_cache.get_default_cleanup_policy_bitflags();
         }
     }
 
@@ -429,11 +429,17 @@ ss::future<topic_result> topics_frontend::do_create_topic(
   custom_assignable_topic_configuration assignable_config,
   model::timeout_clock::time_point timeout) {
     if (_topics.local().contains(assignable_config.cfg.tp_ns)) {
+        vlog(
+          clusterlog.trace,
+          "unable to create topic {} as it already exists",
+          assignable_config.cfg.tp_ns);
         co_return topic_result(
           assignable_config.cfg.tp_ns, errc::topic_already_exists);
     }
 
-    if (_migrated_resources.is_already_migrated(assignable_config.cfg.tp_ns)) {
+    if (
+      !assignable_config.cfg.is_migrated
+      && _migrated_resources.is_already_migrated(assignable_config.cfg.tp_ns)) {
         vlog(
           clusterlog.warn,
           "unable to create topic {} as it is being migrated",
@@ -560,6 +566,12 @@ ss::future<topic_result> topics_frontend::do_create_topic(
     bool configured_label_from_manifest
       = assignable_config.is_read_replica()
         || assignable_config.is_recovery_enabled();
+    // We set a remote label if:
+    // - we haven't got a remote label from the cloud (i.e. this isn't a read
+    //   replica or recovery topic),
+    // - there is a cluster UUID (always expected),
+    // - the remote labels feature is active,
+    // - the config to disable remote labels is False
     if (
       !configured_label_from_manifest
       && !assignable_config.cfg.properties.remote_label.has_value()
@@ -688,7 +700,7 @@ ss::future<std::vector<topic_result>> topics_frontend::delete_topics(
       std::end(topics),
       std::back_inserter(futures),
       [this, timeout](model::topic_namespace& tp_ns) {
-          return do_delete_topic(std::move(tp_ns), timeout);
+          return do_delete_topic(std::move(tp_ns), timeout, false);
       });
 
     return ss::when_all_succeed(futures.begin(), futures.end())
@@ -704,22 +716,36 @@ ss::future<std::vector<topic_result>> topics_frontend::delete_topics(
       });
 }
 
+ss::future<errc> topics_frontend::delete_topic_after_migration(
+  model::topic_namespace nt, model::timeout_clock::time_point timeout) {
+    auto result = co_await do_delete_topic(std::move(nt), timeout, true);
+    if (result.ec == errc::success) {
+        std::ignore = co_await stm_linearizable_barrier(timeout);
+    }
+    co_return result.ec;
+}
+
 ss::future<topic_result> topics_frontend::do_delete_topic(
-  model::topic_namespace tp_ns, model::timeout_clock::time_point timeout) {
+  model::topic_namespace tp_ns,
+  model::timeout_clock::time_point timeout,
+  bool migrated_away) {
     // Look up config
     auto topic_meta_opt = _topics.local().get_topic_metadata_ref(tp_ns);
     if (!topic_meta_opt.has_value()) {
         topic_result result(std::move(tp_ns), errc::topic_not_exists);
         return ss::make_ready_future<topic_result>(result);
     }
-    auto state = _migrated_resources.get_topic_state(tp_ns);
-    if (state != data_migrations::migrated_resource_state::non_restricted) {
-        vlog(
-          clusterlog.warn,
-          "can not delete topic as it is being {} by migration",
-          state);
-        topic_result result(std::move(tp_ns), errc::resource_is_being_migrated);
-        return ss::make_ready_future<topic_result>(result);
+    if (!migrated_away) {
+        auto state = _migrated_resources.get_topic_state(tp_ns);
+        if (state != data_migrations::migrated_resource_state::non_restricted) {
+            vlog(
+              clusterlog.warn,
+              "can not delete topic as it is being {} by migration",
+              state);
+            topic_result result(
+              std::move(tp_ns), errc::resource_is_being_migrated);
+            return ss::make_ready_future<topic_result>(result);
+        }
     }
     // Before deleting a topic we need to make sure there are no transforms
     // hooked up to it first.
@@ -733,13 +759,13 @@ ss::future<topic_result> topics_frontend::do_delete_topic(
         topic_result result(std::move(tp_ns), errc::source_topic_still_in_use);
         return ss::make_ready_future<topic_result>(result);
     }
-    auto& topic_meta = topic_meta_opt.value().get();
-
     // Lifecycle marker driven deletion is added alongside the v2 manifest
     // format in Redpanda 23.2.  Before that, we write legacy one-shot
     // deletion records.
-    if (!_features.local().is_active(
-          features::feature::cloud_storage_manifest_format_v2)) {
+    if (
+      !migrated_away
+      && !_features.local().is_active(
+        features::feature::cloud_storage_manifest_format_v2)) {
         // This is not unsafe, but emit a warning in case we have some bug that
         // causes a cluster to indefinitely use the legacy path, so that
         // someone has a chance to notice.
@@ -773,15 +799,18 @@ ss::future<topic_result> topics_frontend::do_delete_topic(
 
     // Default to traditional deletion, without tombstones
     // Use tombstones for tiered storage topics that require remote erase
-    topic_lifecycle_transition_mode mode
-      = topic_meta.get_configuration().properties.requires_remote_erase()
-          ? topic_lifecycle_transition_mode::pending_gc
-          : topic_lifecycle_transition_mode::oneshot_delete;
-
-    if (mode == topic_lifecycle_transition_mode::oneshot_delete) {
-        vlog(clusterlog.info, "Deleting topic {}", tp_ns);
-    } else if (mode == topic_lifecycle_transition_mode::pending_gc) {
+    auto& topic_meta = topic_meta_opt.value().get();
+    topic_lifecycle_transition_mode mode;
+    if (migrated_away) {
+        mode = topic_lifecycle_transition_mode::delete_migrated;
+        vlog(clusterlog.info, "Deleting migrated topic {}", tp_ns);
+    } else if (topic_meta.get_configuration()
+                 .properties.requires_remote_erase()) {
+        mode = topic_lifecycle_transition_mode::pending_gc;
         vlog(clusterlog.info, "Created deletion marker for topic {}", tp_ns);
+    } else {
+        mode = topic_lifecycle_transition_mode::oneshot_delete;
+        vlog(clusterlog.info, "Deleting topic {}", tp_ns);
     }
 
     auto remote_revision = topic_meta.get_remote_revision().value_or(
@@ -1640,10 +1669,10 @@ ss::future<topics_frontend::capacity_info> topics_frontend::get_health_info(
 
     for (auto& node_report : health_report.value().node_reports) {
         co_await ss::max_concurrent_for_each(
-          std::move(node_report->topics),
+          node_report->topics,
           32,
-          [&info](const topic_status& status) {
-              for (const auto& partition : status.partitions) {
+          [&info](const node_health_report::topics_t::value_type& status) {
+              for (const auto& partition : status.second) {
                   info.ntp_sizes[partition.id] = partition.size_bytes;
               }
               return ss::now();

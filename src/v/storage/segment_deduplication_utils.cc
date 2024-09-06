@@ -65,7 +65,7 @@ ss::future<bool> build_offset_map_for_segment(
       compaction_idx_path, cfg.sanitizer_config);
     std::exception_ptr eptr;
     auto rdr = make_file_backed_compacted_reader(
-      compaction_idx_path, compaction_idx_file, cfg.iopc, 64_KiB);
+      compaction_idx_path, compaction_idx_file, cfg.iopc, 64_KiB, cfg.asrc);
     try {
         co_await rdr.verify_integrity();
     } catch (...) {
@@ -225,7 +225,8 @@ ss::future<index_state> deduplicate_segment(
       should_offset_delta_times,
       seg->offsets().get_committed_offset(),
       &cmp_idx_writer,
-      inject_reader_failure);
+      inject_reader_failure,
+      cfg.asrc);
 
     auto new_idx = co_await std::move(rdr).consume(
       std::move(copy_reducer), model::no_timeout);

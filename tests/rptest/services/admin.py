@@ -583,6 +583,9 @@ class Admin:
                                                   backoff_s=backoff_s)
             if check(info.leader):
                 return True, info.leader
+
+            self.redpanda.logger.debug(
+                f"check failed (leader id: {info.leader})")
             return False
 
         return wait_until_result(
@@ -688,8 +691,10 @@ class Admin:
     def get_status_ready(self, node=None):
         return self._request("GET", "status/ready", node=node).json()
 
-    def get_cluster_config(self, node=None, include_defaults=None):
-        if include_defaults is not None:
+    def get_cluster_config(self, node=None, include_defaults=None, key=None):
+        if key is not None:
+            kwargs = {"params": {"key": key}}
+        elif include_defaults is not None:
             kwargs = {"params": {"include_defaults": include_defaults}}
         else:
             kwargs = {}
@@ -1029,24 +1034,6 @@ class Admin:
         """
         path = f"transaction/{tid}/find_coordinator"
         return self._request('get', path, node=node).json()
-
-    def describe_tx_registry(self, node=None):
-        """
-        describe_tx_registry
-        """
-        path = f"tx_registry"
-        info = self._request('get', path, node=node).json()
-        mapping = {
-            x["partition_id"]: x["hosted_txs"]
-            for x in info["tx_mapping"]
-        }
-        for key in mapping:
-            if "excluded_transactions" not in mapping[key]:
-                mapping[key]["excluded_transactions"] = []
-            if "included_transactions" not in mapping[key]:
-                mapping[key]["included_transactions"] = []
-        info["tx_mapping"] = mapping
-        return info
 
     def set_partition_replicas(self,
                                topic,
@@ -1585,6 +1572,7 @@ class Admin:
                                ns: str | None = None,
                                topic: str | None = None,
                                disabled: bool | None = None,
+                               with_internal: bool | None = None,
                                node=None):
         if topic is not None:
             assert ns is not None
@@ -1595,6 +1583,9 @@ class Admin:
 
         if disabled is not None:
             req += f"?disabled={disabled}"
+
+        if with_internal is not None:
+            req += f"?with_internal={with_internal}"
 
         return self._request("GET", req, node=node).json()
 

@@ -32,12 +32,10 @@ result_promise_t::future_type request::result() const {
 }
 
 void request::set_value(request_result_t::value_type value) {
-    vassert(
-      _state <= request_state::in_progress && !_result.available(),
-      "unexpected request state during result set: {}",
-      *this);
-    _result.set_value(value);
-    _state = request_state::completed;
+    if (_state != request_state::completed) {
+        _result.set_value(value);
+        _state = request_state::completed;
+    }
 }
 
 void request::set_error(request_result_t::error_type error) {
@@ -124,6 +122,16 @@ std::optional<request_ptr> requests::last_request() const {
     return std::nullopt;
 }
 
+void requests::reset(request_result_t::error_type error) {
+    for (auto& request : _inflight_requests) {
+        if (!request->has_completed()) {
+            request->set_error(error);
+        }
+    }
+    _inflight_requests.clear();
+    _finished_requests.clear();
+}
+
 bool requests::is_valid_sequence(seq_t incoming) const {
     auto last_req = last_request();
     return
@@ -140,13 +148,7 @@ result<request_ptr> requests::try_emplace(
     if (reset_sequences) {
         // reset all the sequence tracking state, avoids any sequence
         // checks for sequence tracking.
-        while (!_inflight_requests.empty()) {
-            if (!_inflight_requests.front()->has_completed()) {
-                _inflight_requests.front()->set_error(errc::timeout);
-            }
-            _inflight_requests.pop_front();
-        }
-        _finished_requests.clear();
+        reset(errc::timeout);
     } else {
         // gc and fail any inflight requests from old terms
         // these are guaranteed to be failed because of sync() guarantees
@@ -223,15 +225,7 @@ void requests::gc_requests_from_older_terms(model::term_id current_term) {
     }
 }
 
-void requests::shutdown() {
-    for (auto& request : _inflight_requests) {
-        if (!request->has_completed()) {
-            request->_result.set_value(cluster::errc::shutting_down);
-        }
-    }
-    _inflight_requests.clear();
-    _finished_requests.clear();
-}
+void requests::shutdown() { reset(cluster::errc::shutting_down); }
 
 producer_state::producer_state(
   prefix_logger& logger,
@@ -328,6 +322,22 @@ bool producer_state::can_evict() {
     return true;
 }
 
+void producer_state::reset_with_new_epoch(model::producer_epoch new_epoch) {
+    vassert(
+      new_epoch > _id.get_epoch(),
+      "Invalid epoch bump to {} for producer {}",
+      new_epoch,
+      *this);
+    vassert(
+      !_transaction_state,
+      "Invalid epoch bump to {} for a non idempotent producer: {}",
+      new_epoch,
+      *this);
+    vlog(_logger.info, "[{}] Reseting epoch to {}", *this, new_epoch);
+    _requests.reset(errc::timeout);
+    _id = model::producer_identity(_id.id, new_epoch);
+}
+
 result<request_ptr> producer_state::try_emplace_request(
   const model::batch_identity& bid, model::term_id current_term, bool reset) {
     if (bid.first_seq > bid.last_seq) {
@@ -365,6 +375,9 @@ void producer_state::apply_data(
     if (!bid.is_idempotent() || _evicted) {
         return;
     }
+    if (!bid.is_transactional && bid.pid.epoch > _id.epoch) {
+        reset_with_new_epoch(bid.pid.epoch);
+    }
     _requests.stm_apply(bid, header.ctx.term, offset);
     if (bid.is_transactional) {
         if (!_transaction_state) {
@@ -394,19 +407,29 @@ void producer_state::apply_data(
 void producer_state::apply_transaction_begin(
   const model::record_batch_header& header,
   const fence_batch_data& parsed_batch) {
-    vassert(
-      !has_transaction_in_progress() && !_active_transaction_hook.is_linked(),
-      "Transaction already in progress {} for producer {}, hook {}",
-      _transaction_state,
-      *this,
-      _active_transaction_hook.is_linked());
-    // update pid incase the producer got fenced.
     const auto& pid = parsed_batch.bid.pid;
-    vassert(
-      pid.epoch >= _id.epoch,
-      "[{}] Invalid fencing using a pid with lower epoch: {}",
-      *this,
-      header);
+    if (pid.epoch < _id.epoch) {
+        vlog(
+          _logger.error,
+          "[{}] Epoch downgrade to {}, ignoring batch {}",
+          *this,
+          pid,
+          header);
+        return;
+    }
+    if (has_transaction_in_progress() || _active_transaction_hook.is_linked()) {
+        // We have checks in place in the stm so this does not happen. If it
+        // still does it could be a bug or the log has been truncated and some
+        // entries disappeared. We log and move on to make forward progress.
+        vlog(
+          _logger.error,
+          "[{}] Encountered a begin batch {} while transaction already in "
+          "progress, overriding transaction state to make forward progress. "
+          "This can have unintended consequences. Hook state: {}",
+          *this,
+          header,
+          _active_transaction_hook.is_linked());
+    }
     _id = pid;
     _transaction_state = std::make_unique<producer_partition_transaction_state>(
       producer_partition_transaction_state{
@@ -443,7 +466,8 @@ producer_state::apply_transaction_end(model::control_record_type crt) {
     } else if (crt == model::control_record_type::tx_abort) {
         _transaction_state->status = partition_transaction_status::aborted;
     } else {
-        vassert(false, "Invalid control batch type: {}", crt);
+        vlog(_logger.error, "Ignoring invalid control batch type: {}", crt);
+        return std::nullopt;
     }
     return model::tx_range{
       id(), _transaction_state->first, _transaction_state->last};
@@ -478,12 +502,14 @@ producer_state::snapshot(kafka::offset log_start_offset) const {
     snapshot.ms_since_last_update = ms_since_last_update();
     snapshot.finished_requests.reserve(_requests._finished_requests.size());
     for (auto& req : _requests._finished_requests) {
-        vassert(
-          req->has_completed(),
-          "_finished_requests has unresolved promise: {}, range:[{}, {}]",
-          *this,
-          req->_first_sequence,
-          req->_last_sequence);
+        if (!req->has_completed()) {
+            vlog(
+              _logger.error,
+              "[{}] Ignoring unresolved finished request {} during snapshot",
+              *this,
+              *req);
+            continue;
+        }
         auto kafka_offset
           = req->_result.get_shared_future().get().value().last_offset;
         // offsets older than log start are no longer interesting.

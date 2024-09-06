@@ -22,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	dataplanev1alpha1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1alpha1"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/transform/project"
@@ -74,7 +76,7 @@ transform. Re-deploying the transform will cause processing to pick up at the la
 committed offset. Recall that this state is maintained until the transform is deleted.
 `,
 		Args: cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitServerlessAdmin(p)
@@ -123,7 +125,7 @@ committed offset. Recall that this state is maintained until the transform is de
 			offset, err := parseOffset(cfg.FromOffset)
 			out.MaybeDieErr(err)
 
-			t := adminapi.TransformMetadata{
+			t := rpadmin.TransformMetadata{
 				InputTopic:      cfg.InputTopic,
 				OutputTopics:    cfg.OutputTopics,
 				Name:            cfg.Name,
@@ -140,7 +142,7 @@ committed offset. Recall that this state is maintained until the transform is de
 				out.MaybeDie(err, "unable to initialize cloud client: %v", err)
 
 				err = cl.Transform.DeployTransform(cmd.Context(), publicapi.DeployTransformRequest{
-					Metadata:   adminApiToDataplaneMetadata(t),
+					Metadata:   adminAPIToDataplaneMetadata(t),
 					WasmBinary: wasm,
 				})
 				out.MaybeDie(err, "unable to deploy transform to Cloud Cluster: %v", err)
@@ -149,7 +151,7 @@ committed offset. Recall that this state is maintained until the transform is de
 				out.MaybeDie(err, "unable to initialize admin api client: %v", err)
 
 				err = api.DeployWasmTransform(cmd.Context(), t, wasm)
-				if he := (*adminapi.HTTPResponseError)(nil); errors.As(err, &he) {
+				if he := (*rpadmin.HTTPResponseError)(nil); errors.As(err, &he) {
 					if he.Response.StatusCode == 400 {
 						body, bodyErr := he.DecodeGenericErrorBody()
 						if bodyErr == nil {
@@ -320,12 +322,12 @@ func loadWasmFromNetwork(ctx context.Context, url string) (io.Reader, error) {
 }
 
 // mapToEnvVars converts a map to the adminapi environment variable type.
-func mapToEnvVars(env map[string]string) (vars []adminapi.EnvironmentVariable) {
+func mapToEnvVars(env map[string]string) (vars []rpadmin.EnvironmentVariable) {
 	if env == nil {
 		return
 	}
 	for k, v := range env {
-		vars = append(vars, adminapi.EnvironmentVariable{
+		vars = append(vars, rpadmin.EnvironmentVariable{
 			Key:   k,
 			Value: v,
 		})
@@ -333,13 +335,13 @@ func mapToEnvVars(env map[string]string) (vars []adminapi.EnvironmentVariable) {
 	return
 }
 
-// parseOffset converts a string formatted offset to the adminapi offset type
-func parseOffset(formatted_offset string) (*adminapi.Offset, error) {
-	if formatted_offset == "" {
+// parseOffset converts a string formatted offset to the adminapi offset type.
+func parseOffset(formattedOffset string) (*rpadmin.Offset, error) {
+	if formattedOffset == "" {
 		return nil, nil
 	}
-	format := ""
-	switch pfx := formatted_offset[0:1]; pfx {
+	var format string
+	switch pfx := formattedOffset[0:1]; pfx {
 	case "@":
 		format = "timestamp"
 	case "+":
@@ -347,18 +349,18 @@ func parseOffset(formatted_offset string) (*adminapi.Offset, error) {
 	case "-":
 		format = "from_end"
 	default:
-		return nil, fmt.Errorf("Bad prefix: expected one of ['@','+','-'], got: %q", pfx)
+		return nil, fmt.Errorf("bad prefix: expected one of ['@','+','-'], got: %q", pfx)
 	}
 
-	val, err := strconv.ParseInt(formatted_offset[1:], 10, 64)
+	val, err := strconv.ParseInt(formattedOffset[1:], 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("Bad offset: parse error '%v'", err)
+		return nil, fmt.Errorf("bad offset: parse error '%v'", err)
 	}
 
-	return &adminapi.Offset{Format: format, Value: val}, nil
+	return &rpadmin.Offset{Format: format, Value: val}, nil
 }
 
-func adminApiToDataplaneMetadata(m adminapi.TransformMetadata) *dataplanev1alpha1.DeployTransformRequest {
+func adminAPIToDataplaneMetadata(m rpadmin.TransformMetadata) *dataplanev1alpha1.DeployTransformRequest {
 	var envs []*dataplanev1alpha1.TransformMetadata_EnvironmentVariable
 	for _, e := range m.Environment {
 		envs = append(envs, &dataplanev1alpha1.TransformMetadata_EnvironmentVariable{

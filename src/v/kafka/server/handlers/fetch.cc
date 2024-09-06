@@ -15,18 +15,18 @@
 #include "cluster/shard_table.h"
 #include "config/configuration.h"
 #include "container/fragmented_vector.h"
-#include "kafka/latency_probe.h"
 #include "kafka/protocol/batch_consumer.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
-#include "kafka/read_distribution_probe.h"
 #include "kafka/server/fetch_session.h"
 #include "kafka/server/fwd.h"
 #include "kafka/server/handlers/details/leader_epoch.h"
 #include "kafka/server/handlers/fetch/fetch_plan_executor.h"
 #include "kafka/server/handlers/fetch/fetch_planner.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
+#include "kafka/server/latency_probe.h"
 #include "kafka/server/partition_proxy.h"
+#include "kafka/server/read_distribution_probe.h"
 #include "kafka/server/replicated_partition.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -1336,12 +1336,20 @@ class simple_fetch_planner final : public fetch_planner::impl {
               }
 
               auto& tp = fp.topic_partition;
+              auto tn_view = tp.as_tn_view();
+              const auto& metadata_cache = octx.rctx.metadata_cache();
+              auto partition_id = tp.get_partition();
 
-              if (unlikely(octx.rctx.metadata_cache().is_disabled(
-                    tp.as_tn_view(), tp.get_partition()))) {
+              if (unlikely(metadata_cache.is_disabled(tn_view, partition_id))) {
                   resp_it->set(make_partition_response_error(
-                    fp.topic_partition.get_partition(),
-                    error_code::replica_not_available));
+                    partition_id, error_code::replica_not_available));
+                  ++resp_it;
+                  return;
+              }
+
+              if (unlikely(metadata_cache.should_reject_reads(tn_view))) {
+                  resp_it->set(make_partition_response_error(
+                    partition_id, error_code::invalid_topic_exception));
                   ++resp_it;
                   return;
               }
@@ -1358,11 +1366,10 @@ class simple_fetch_planner final : public fetch_planner::impl {
                    * return not_leader_for_partition error to force metadata
                    * update.
                    */
-                  auto ec = octx.rctx.metadata_cache().contains(tp.to_ntp())
+                  auto ec = metadata_cache.contains(tp.to_ntp())
                               ? error_code::not_leader_for_partition
                               : error_code::unknown_topic_or_partition;
-                  resp_it->set(make_partition_response_error(
-                    fp.topic_partition.get_partition(), ec));
+                  resp_it->set(make_partition_response_error(partition_id, ec));
                   ++resp_it;
                   return;
               }
@@ -1484,6 +1491,10 @@ ss::future<> do_fetch(op_context& octx) {
     }
 }
 } // namespace
+
+namespace testing {
+ss::future<> do_fetch(op_context& octx) { return ::kafka::do_fetch(octx); }
+} // namespace testing
 
 template<>
 ss::future<response_ptr>

@@ -23,8 +23,13 @@ def read_remote_label_serde(rdr: Reader):
     return rdr.read_envelope(lambda rdr, _: {"cluster_uuid": rdr.read_uuid()})
 
 
-def read_topic_properties_serde(rdr: Reader, version):
+def read_topic_namespace(rdr: Reader):
+    namespace = rdr.read_string()
+    topic = rdr.read_string()
+    return f"{namespace}/{topic}"
 
+
+def read_topic_properties_serde(rdr: Reader, version):
     topic_properties = {
         'compression': rdr.read_optional(Reader.read_serde_enum),
         'cleanup_policy_bitflags': rdr.read_optional(Reader.read_serde_enum),
@@ -119,7 +124,8 @@ def read_topic_properties_serde(rdr: Reader, version):
         }
     if version >= 9:
         topic_properties |= {
-            'remote_labels': rdr.read_optional(read_remote_label_serde)
+            'remote_label': rdr.read_optional(read_remote_label_serde),
+            'topic_namespace_override': rdr.read_optional(read_topic_namespace)
         }
 
     return topic_properties
@@ -141,6 +147,7 @@ def read_topic_config(rdr: Reader, version):
     if version < 1:
         # see https://github.com/redpanda-data/redpanda/pull/6613
         decoded['properties']['remote_delete'] = False
+    decoded['is_migrated'] = rdr.read_bool() if version >= 2 else False
 
     return decoded
 
@@ -149,7 +156,7 @@ def read_topic_configuration_assignment_serde(rdr: Reader):
     return rdr.read_envelope(
         lambda rdr, _: {
             'cfg':
-            rdr.read_envelope(read_topic_config, 1),
+            rdr.read_envelope(read_topic_config, 2),
             'assignments':
             rdr.read_serde_vector(lambda r: r.read_envelope(
                 lambda ir, _: {
@@ -996,7 +1003,7 @@ def read_config_status(rdr: Reader, v: int):
 
 def read_topic_metadata_fields(rdr: Reader, v: int):
     v = {}
-    v |= {"configuration": rdr.read_envelope(read_topic_config, max_version=1)}
+    v |= {"configuration": rdr.read_envelope(read_topic_config, max_version=2)}
     v |= {"src_topic": rdr.read_optional(Reader.read_string)}
     v |= {"revision": rdr.read_int64()}
     v |= {"remote_revision": rdr.read_optional(Reader.read_int64)}
@@ -1124,8 +1131,7 @@ class ControllerSnapshot():
 
     def read_topics(self, rdr: Reader, version: int):
         def read_tp_ns_to_str(rdr: Reader):
-            v = read_topic_namespace(rdr)
-            return f"{v['namespace']}/{v['topic']}"
+            return read_topic_namespace(rdr)
 
         def read_partition_t(rdr: Reader, version: int):
             v = {}

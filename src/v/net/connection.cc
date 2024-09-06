@@ -17,6 +17,8 @@
 #include <seastar/core/future.hh>
 #include <seastar/net/tls.hh>
 
+#include <system_error>
+
 namespace net {
 
 /**
@@ -40,7 +42,9 @@ bool is_reconnect_error(const std::system_error& e) {
     if (e.code().category() == ss::tls::error_category()) {
         return absl::c_any_of(
           ss_tls_reconnect_errors, [v](int ec) { return v == ec; });
-    } else {
+    } else if (
+      e.code().category() == std::system_category()
+      || e.code().category() == std::generic_category()) {
         switch (v) {
         case ECONNREFUSED:
         case ENETUNREACH:
@@ -58,6 +62,9 @@ bool is_reconnect_error(const std::system_error& e) {
         default:
             return false;
         }
+    } else {
+        // We don't know what the error category is at this point
+        return false;
     }
     __builtin_unreachable();
 }
@@ -72,7 +79,7 @@ bool is_reconnect_error(const std::system_error& e) {
 std::optional<ss::sstring> is_disconnect_exception(std::exception_ptr e) {
     try {
         rethrow_exception(e);
-    } catch (std::system_error& e) {
+    } catch (const std::system_error& e) {
         if (is_reconnect_error(e)) {
             return e.code().message();
         }

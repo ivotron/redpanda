@@ -191,6 +191,33 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
                 assert node.account.isdir(path)
 
     @cluster(num_nodes=3)
+    def test_max_timeout(self):
+        rpk = RpkTool(self.redpanda)
+        max_timeout_ms = int(
+            rpk.cluster_config_get("transaction_max_timeout_ms"))
+        test_timeout_ms = max_timeout_ms + 100
+
+        def init_producer(timeout_ms: int):
+            producer = ck.Producer({
+                'bootstrap.servers': self.redpanda.brokers(),
+                'transactional.id': '0',
+                'transaction.timeout.ms': test_timeout_ms,
+            })
+            producer.init_transactions()
+
+        try:
+            init_producer(test_timeout_ms)
+            assert False, "producer session established with a timeout larger than allowed limit"
+        except ck.cimpl.KafkaException as e:
+            kafka_error = e.args[0]
+            assert kafka_error.code(
+            ) == ck.KafkaError.INVALID_TRANSACTION_TIMEOUT, f"Unexpected error {kafka_error.code()}"
+
+        # Bump timeout and check again.
+        rpk.cluster_config_set("transaction_max_timeout_ms", test_timeout_ms)
+        init_producer(test_timeout_ms)
+
+    @cluster(num_nodes=3)
     def simple_test(self):
         self.generate_data(self.input_t, self.max_records)
 
@@ -269,6 +296,8 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
 
     @cluster(num_nodes=3)
     def rejoin_member_test(self):
+        self.redpanda.set_cluster_config(
+            {"group_new_member_join_timeout": 5000})
         self.generate_data(self.input_t, self.max_records)
 
         producer = ck.Producer({
@@ -282,6 +311,8 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
             'group.id': group_name,
             'auto.offset.reset': 'earliest',
             'enable.auto.commit': False,
+            'max.poll.interval.ms': 10000,
+            'session.timeout.ms': 8000
         })
 
         producer.init_transactions()
@@ -303,18 +334,20 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
             'group.id': group_name,
             'auto.offset.reset': 'earliest',
             'enable.auto.commit': False,
+            'max.poll.interval.ms': 10000,
+            'session.timeout.ms': 8000
         })
 
         consumer2.subscribe([self.input_t])
         # Rejoin can take some time, so we should pass big timeout
-        self.consume(consumer2, timeout_s=360)
+        self.consume(consumer2, timeout_s=60)
 
         try:
             producer.send_offsets_to_transaction(offsets, metadata, 2)
             assert False, "send_offsetes should fail"
         except ck.cimpl.KafkaException as e:
             kafka_error = e.args[0]
-            assert kafka_error.code() == ck.cimpl.KafkaError._FENCED
+            assert kafka_error.code() == ck.KafkaError.UNKNOWN_MEMBER_ID
 
         try:
             # if abort fails an app should recreate a producer otherwise
@@ -385,7 +418,7 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
         producer = ck.Producer({
             'bootstrap.servers': self.redpanda.brokers(),
             'transactional.id': '0',
-            'transaction.timeout.ms': 3600000,  # to avoid timing out
+            'transaction.timeout.ms': 900000,  # to avoid timing out
         })
         producer.init_transactions()
         producer.begin_transaction()
@@ -414,8 +447,9 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
         try:
             producer.commit_transaction()
             assert False, "transaction should have been aborted by now."
-        except ck.KafkaException:
-            pass
+        except ck.KafkaException as e:
+            assert e.args[0].code(
+            ) == ck.KafkaError.INVALID_PRODUCER_ID_MAPPING, f"Invalid error thrown on expiration {e}"
 
     @cluster(num_nodes=3)
     def expired_tx_test(self):
@@ -469,6 +503,18 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
             timeout_sec=30,
             backoff_sec=2,
             err_msg="Transactions are still running, expected to be expired.")
+
+        try:
+            producer.produce(self.input_t.name,
+                             'test-post-expire',
+                             'test-post-expire',
+                             partition=0,
+                             on_delivery=self.on_delivery)
+            producer.flush()
+            assert False, "tx is expected to be expired"
+        except ck.cimpl.KafkaException as e:
+            kafka_error = e.args[0]
+            assert kafka_error.code() == ck.cimpl.KafkaError._FENCED
 
         try:
             producer.commit_transaction()
@@ -568,7 +614,7 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
             ck.Producer({
                 'bootstrap.servers': self.redpanda.brokers(),
                 'transactional.id': str(i),
-                'transaction.timeout.ms': 1000000,
+                'transaction.timeout.ms': 900000,
             }) for i in range(0, p_count)
         ]
 
@@ -871,14 +917,6 @@ class TransactionsTest(RedpandaTest, TransactionsMixin):
                    timeout_sec=30,
                    backoff_sec=2,
                    err_msg="Producers not evicted in time")
-
-        try:
-            _produce_one(producers[0], 0)
-            assert False, "We can not produce after cleaning in rm_stm"
-        except ck.cimpl.KafkaException as e:
-            kafka_error = e.args[0]
-            kafka_error.code(
-            ) == ck.cimpl.KafkaError.OUT_OF_ORDER_SEQUENCE_NUMBER
 
         # validate that the producers are evicted with LRU policy,
         # starting from this producer there should be no sequence

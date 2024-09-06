@@ -169,10 +169,8 @@ struct convert<model::cleanup_policy_bitflags> {
     static Node encode(const type& rhs) {
         Node node;
 
-        auto compaction = (rhs & model::cleanup_policy_bitflags::compaction)
-                          == model::cleanup_policy_bitflags::compaction;
-        auto deletion = (rhs & model::cleanup_policy_bitflags::deletion)
-                        == model::cleanup_policy_bitflags::deletion;
+        auto compaction = model::is_compaction_enabled(rhs);
+        auto deletion = model::is_deletion_enabled(rhs);
 
         if (compaction && deletion) {
             node = "compact,delete";
@@ -370,7 +368,12 @@ struct convert<model::cloud_storage_backend> {
     using type = model::cloud_storage_backend;
 
     static constexpr auto acceptable_values = std::to_array(
-      {"aws", "google", "azure", "minio", "unknown"});
+      {"aws",
+       "google_s3_compat",
+       "azure",
+       "minio",
+       "oracle_s3_compat",
+       "unknown"});
 
     static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
 
@@ -390,6 +393,9 @@ struct convert<model::cloud_storage_backend> {
                   model::cloud_storage_backend::google_s3_compat)
                 .match("minio", model::cloud_storage_backend::minio)
                 .match("azure", model::cloud_storage_backend::azure)
+                .match(
+                  "oracle_s3_compat",
+                  model::cloud_storage_backend::oracle_s3_compat)
                 .match("unknown", model::cloud_storage_backend::unknown);
 
         return true;
@@ -604,6 +610,26 @@ struct convert<config::fips_mode_flag> {
                 .match(to_string_view(type::permissive), type::permissive);
 
         return true;
+    }
+};
+
+template<>
+struct convert<config::tls_version> {
+    using type = config::tls_version;
+
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
+    static bool decode(const Node& node, type& rhs) {
+        auto value = node.as<std::string>();
+        auto out = string_switch<std::optional<type>>(std::string_view{value})
+                     .match(to_string_view(type::v1_0), type::v1_0)
+                     .match(to_string_view(type::v1_1), type::v1_1)
+                     .match(to_string_view(type::v1_2), type::v1_2)
+                     .match(to_string_view(type::v1_3), type::v1_3)
+                     .default_match(std::nullopt);
+        if (out.has_value()) {
+            rhs = out.value();
+        }
+        return out.has_value();
     }
 };
 

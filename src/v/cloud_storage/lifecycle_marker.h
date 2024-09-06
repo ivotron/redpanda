@@ -12,7 +12,7 @@
 
 #include "cloud_storage/remote_path_provider.h"
 #include "cloud_storage_clients/types.h"
-#include "cluster/types.h"
+#include "cluster/nt_revision.h"
 #include "hashing/xx.h"
 
 namespace cloud_storage {
@@ -93,6 +93,8 @@ struct remote_nt_lifecycle_marker
     cluster::nt_revision topic;
 
     lifecycle_status status;
+
+    auto serde_fields() { return std::tie(cluster_id, topic, status); }
 
     cloud_storage_clients::object_key
     get_key(const remote_path_provider& path_provider) {

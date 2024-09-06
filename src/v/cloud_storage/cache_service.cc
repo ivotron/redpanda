@@ -18,7 +18,6 @@
 #include "seastar/util/file.hh"
 #include "ssx/future-util.h"
 #include "ssx/sformat.h"
-#include "storage/segment.h"
 #include "utils/human.h"
 
 #include <seastar/core/coroutine.hh>
@@ -173,7 +172,7 @@ cache::delete_file_and_empty_parents(const std::string_view& key) {
             vlog(cst_log.trace, "Removing {}", normal_path);
             co_await ss::remove_file(normal_path.native());
             deletions++;
-        } catch (std::filesystem::filesystem_error& e) {
+        } catch (const std::filesystem::filesystem_error& e) {
             if (e.code() == std::errc::directory_not_empty) {
                 // we stop when we find a non-empty directory
                 co_return deletions > 1;
@@ -230,8 +229,8 @@ ss::future<> cache::clean_up_at_start() {
             try {
                 co_await delete_file_and_empty_parents(filepath_to_remove);
                 deleted_bytes += file_item.size;
-                deleted_bytes++;
-            } catch (std::exception& e) {
+                deleted_count++;
+            } catch (const std::exception& e) {
                 vlog(
                   cst_log.error,
                   "Startup cache cleanup couldn't delete {}: {}.",
@@ -244,7 +243,7 @@ ss::future<> cache::clean_up_at_start() {
     for (const auto& path : empty_dirs) {
         try {
             co_await ss::remove_file(path);
-        } catch (std::exception& e) {
+        } catch (const std::exception& e) {
             // Leaving an empty dir will not prevent progress, so tolerate
             // errors on deletion (could be e.g. a permissions error)
             vlog(
@@ -391,7 +390,7 @@ ss::future<> cache::trim(
     vlog(
       cst_log.debug,
       "in-memory trim: set target_size {}/{}, size {}/{}, reserved {}/{}, "
-      "pending {}/{}), candidates for deletion: {}, size to delete: {}, "
+      "pending {}/{}, candidates for deletion: {}, size to delete: {}, "
       "objects to delete: {}",
       target_size,
       target_objects,
@@ -429,8 +428,16 @@ ss::future<> cache::trim(
     auto undeletable_bytes = (co_await access_time_tracker_size()).value_or(0);
 
     if (
-      size_to_delete < undeletable_bytes
-      && objects_to_delete < undeletable_objects) {
+      size_to_delete <= undeletable_bytes
+      && objects_to_delete <= undeletable_objects) {
+        vlog(
+          cst_log.debug,
+          "in-memory trim finished: size/objects to delete: {}/{}, undeletable "
+          "size/objects: {}/{}",
+          size_to_delete,
+          objects_to_delete,
+          undeletable_bytes,
+          undeletable_objects);
         _last_clean_up = ss::lowres_clock::now();
         _last_trim_failed = false;
         co_return;
@@ -466,7 +473,7 @@ ss::future<> cache::trim(
     vlog(
       cst_log.debug,
       "trim: set target_size {}/{}, size {}/{}, walked size {} (max {}/{}), "
-      " reserved {}/{}, pending {}/{}), candidates for deletion: {}, filtered "
+      " reserved {}/{}, pending {}/{}, candidates for deletion: {}, filtered "
       "out: {}",
       target_size,
       target_objects,
@@ -483,10 +490,8 @@ ss::future<> cache::trim(
       filtered_out_files);
 
     // Sort by atime for the subsequent LRU trimming loop
-    std::sort(
-      candidates_for_deletion.begin(),
-      candidates_for_deletion.end(),
-      [](auto& a, auto& b) { return a.access_time < b.access_time; });
+    std::ranges::sort(
+      candidates_for_deletion, {}, &file_list_item::access_time);
 
     vlog(
       cst_log.debug,
@@ -665,7 +670,7 @@ cache::remove_segment_full(const file_list_item& file_stat) {
                 result.deleted_count += 1;
                 _current_cache_size -= sz;
                 _current_cache_objects -= 1;
-            } catch (std::filesystem::filesystem_error& e) {
+            } catch (const std::filesystem::filesystem_error& e) {
                 if (e.code() != std::errc::no_such_file_or_directory) {
                     throw;
                 }
@@ -681,7 +686,7 @@ cache::remove_segment_full(const file_list_item& file_stat) {
                 result.deleted_count += 1;
                 _current_cache_size -= sz;
                 _current_cache_objects -= 1;
-            } catch (std::filesystem::filesystem_error& e) {
+            } catch (const std::filesystem::filesystem_error& e) {
                 if (e.code() != std::errc::no_such_file_or_directory) {
                     throw;
                 }
@@ -894,7 +899,7 @@ ss::future<std::optional<uint64_t>> cache::access_time_tracker_size() const {
     auto path = _cache_dir / access_time_tracker_file_name;
     try {
         co_return static_cast<uint64_t>(co_await ss::file_size(path.string()));
-    } catch (std::filesystem::filesystem_error& e) {
+    } catch (const std::filesystem::filesystem_error& e) {
         if (e.code() == std::errc::no_such_file_or_directory) {
             co_return std::nullopt;
         } else {
@@ -1156,7 +1161,7 @@ ss::future<std::optional<cache_item>> cache::_get(std::filesystem::path key) {
                 });
             });
         }
-    } catch (std::filesystem::filesystem_error& e) {
+    } catch (const std::filesystem::filesystem_error& e) {
         if (e.code() == std::errc::no_such_file_or_directory) {
             probe.miss_get();
             co_return std::nullopt;
@@ -1243,7 +1248,7 @@ ss::future<> cache::put(
             tmp_cache_file = co_await ss::open_file_dma(
               (dir_path / tmp_filename).native(), flags);
             break;
-        } catch (std::filesystem::filesystem_error& e) {
+        } catch (const std::filesystem::filesystem_error& e) {
             if (e.code() == std::errc::no_such_file_or_directory) {
                 vlog(
                   cst_log.debug,
@@ -1266,7 +1271,7 @@ ss::future<> cache::put(
         co_await ss::copy(data, out)
           .then([&out]() { return out.flush(); })
           .finally([&out]() { return out.close(); });
-    } catch (std::filesystem::filesystem_error& e) {
+    } catch (const std::filesystem::filesystem_error& e) {
         // For ENOSPC errors, delay handling so that we can do a trim
         if (e.code() == std::errc::no_space_on_device) {
             disk_full_error = std::current_exception();
@@ -1358,7 +1363,7 @@ ss::future<> cache::_invalidate(const std::filesystem::path& key) {
         _current_cache_objects -= 1;
         probe.set_size(_current_cache_size);
         probe.set_num_files(_current_cache_objects);
-    } catch (std::filesystem::filesystem_error& e) {
+    } catch (const std::filesystem::filesystem_error& e) {
         if (e.code() == std::errc::no_such_file_or_directory) {
             vlog(
               cst_log.debug,
@@ -1759,6 +1764,12 @@ ss::future<> cache::do_reserve_space(uint64_t bytes, size_t objects) {
                 // do the trim.
                 co_await trim_throttled_unlocked();
                 did_trim = true;
+            } else {
+                vlog(
+                  cst_log.debug,
+                  "Did not trim, may_trim_now: {}, may_exceed: {}",
+                  may_trim_now,
+                  may_exceed);
             }
 
             if (!may_reserve_space(bytes, objects)) {
@@ -1769,6 +1780,10 @@ ss::future<> cache::do_reserve_space(uint64_t bytes, size_t objects) {
                     if (may_exceed) {
                         // Tip off the next caller that they may proactively
                         // exceed the cache size without waiting for a trim.
+                        vlog(
+                          cst_log.debug,
+                          "Last trim failed to free up space, will exceed max "
+                          "bytes");
                         _last_trim_failed = true;
                     }
                 }
@@ -1903,6 +1918,8 @@ ss::future<> cache::initialize(std::filesystem::path cache_dir) {
     if (!co_await ss::file_exists(cache_dir.string())) {
         vlog(cst_log.info, "Creating cache directory {}", cache_dir);
         co_await ss::recursive_touch_directory(cache_dir.string());
+        vlog(
+          cst_log.debug, "Successfully created cache directory {}", cache_dir);
     }
 }
 

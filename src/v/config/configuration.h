@@ -146,7 +146,7 @@ struct configuration final : public config_store {
     deprecated_property tx_registry_sync_timeout_ms;
     deprecated_property tm_violation_recovery_policy;
     property<std::chrono::milliseconds> rm_sync_timeout_ms;
-    property<std::chrono::milliseconds> find_coordinator_timeout_ms;
+    deprecated_property find_coordinator_timeout_ms;
     deprecated_property seq_table_min_size;
     property<std::chrono::milliseconds> tx_timeout_delay_ms;
     deprecated_property rm_violation_recovery_policy;
@@ -195,6 +195,8 @@ struct configuration final : public config_store {
     property<uint64_t> transaction_coordinator_log_segment_size;
     property<std::chrono::milliseconds>
       abort_timed_out_transactions_interval_ms;
+    // same as transaction.max.timeout.ms in Apache Kafka.
+    property<std::chrono::milliseconds> transaction_max_timeout_ms;
     property<std::chrono::seconds> tx_log_stats_interval_s;
     property<std::chrono::milliseconds> create_topic_timeout_ms;
     property<std::chrono::milliseconds> wait_for_leader_timeout_ms;
@@ -463,6 +465,14 @@ struct configuration final : public config_store {
     bounded_property<std::optional<double>, numeric_bounds>
       cloud_storage_cache_trim_threshold_percent_objects;
 
+    property<bool> cloud_storage_inventory_based_scrub_enabled;
+    property<ss::sstring> cloud_storage_inventory_id;
+    property<ss::sstring> cloud_storage_inventory_reports_prefix;
+    property<bool> cloud_storage_inventory_self_managed_report_config;
+    property<std::chrono::milliseconds>
+      cloud_storage_inventory_report_check_interval_ms;
+    property<uint64_t> cloud_storage_inventory_max_hash_size_during_parse;
+
     one_or_many_property<ss::sstring> superusers;
 
     // kakfa queue depth control: latency ewma
@@ -581,6 +591,7 @@ struct configuration final : public config_store {
       enable_schema_id_validation;
     config::property<size_t> kafka_schema_id_validation_cache_capacity;
 
+    property<bool> schema_registry_normalize_on_startup;
     property<std::optional<uint32_t>> pp_sr_smp_max_non_local_requests;
     bounded_property<size_t> max_in_flight_schema_registry_requests_per_shard;
     bounded_property<size_t> max_in_flight_pandaproxy_requests_per_shard;
@@ -607,6 +618,8 @@ struct configuration final : public config_store {
 
     // temporary - to be deprecated
     property<bool> unsafe_enable_consumer_offsets_delete_retention;
+
+    enum_property<tls_version> tls_min_version;
 
     configuration();
 

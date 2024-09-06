@@ -15,6 +15,8 @@
 #include "cluster/rm_stm_types.h"
 #include "cluster/tx_gateway_frontend.h"
 #include "cluster/types.h"
+#include "container/chunked_hash_map.h"
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/wire.h"
 #include "metrics/metrics.h"
 #include "metrics/prometheus_sanitize.h"
@@ -38,6 +40,7 @@
 #include <seastar/coroutine/as_future.hh>
 
 #include <filesystem>
+#include <iterator>
 #include <optional>
 #include <ranges>
 #include <utility>
@@ -128,7 +131,8 @@ ss::future<model::offset> rm_stm::bootstrap_committed_offset() {
       .then([this] { return _raft->committed_offset(); });
 }
 
-producer_ptr rm_stm::maybe_create_producer(model::producer_identity pid) {
+std::pair<producer_ptr, rm_stm::producer_previously_known>
+rm_stm::maybe_create_producer(model::producer_identity pid) {
     // Double lookup because of two reasons
     // 1. we are forced to use a ptr as map value_type because producer_state is
     // not movable
@@ -136,7 +140,7 @@ producer_ptr rm_stm::maybe_create_producer(model::producer_identity pid) {
     // as it is memory friendly.
     auto it = _producers.find(pid.get_id());
     if (it != _producers.end()) {
-        return it->second;
+        return std::make_pair(it->second, producer_previously_known::yes);
     }
     auto producer = ss::make_lw_shared<producer_state>(
       _ctx_log, pid, _raft->group(), [pid, this] {
@@ -145,16 +149,21 @@ producer_ptr rm_stm::maybe_create_producer(model::producer_identity pid) {
     _producer_state_manager.local().register_producer(*producer, _vcluster_id);
     _producers.emplace(pid.get_id(), producer);
 
-    return producer;
+    return std::make_pair(producer, producer_previously_known::no);
 }
 
 void rm_stm::cleanup_producer_state(model::producer_identity pid) {
     auto it = _producers.find(pid.get_id());
     if (it != _producers.end() && it->second->id() == pid) {
-        vassert(
-          !it->second->_active_transaction_hook.is_linked(),
-          "Cleaning up {} while active transaction is in progress",
-          *(it->second));
+        const auto& producer = *(it->second);
+        if (producer._active_transaction_hook.is_linked()) {
+            vlog(
+              _ctx_log.error,
+              "Ignoring cleanup request of producer {} due to in progress "
+              "transaction.",
+              producer);
+            return;
+        }
         _producers.erase(it);
     }
 };
@@ -190,7 +199,7 @@ ss::future<checked<model::term_id, tx::errc>> rm_stm::begin_tx(
         co_return tx::errc::stale;
     }
     auto synced_term = _insync_term;
-    auto producer = maybe_create_producer(new_pid);
+    auto [producer, _] = maybe_create_producer(new_pid);
     co_return co_await producer->run_with_lock(
       [this,
        synced_term,
@@ -245,6 +254,15 @@ ss::future<checked<model::term_id, tx::errc>> rm_stm::do_begin_tx(
       synced_term,
       *producer);
 
+    // Note fencing stale requests:
+    // Fencing is done on two dimensions epoch and sequence number.
+    // 1. If the epoch is bumped, older epochs are rejected (Kafka guarantee)
+    // 2. If the sequence number is advanced, older sequences are rejected.
+    //    Sequence numbers are advanced by the coordinator for every new
+    //    transaction with the same epoch. If there is a request from a stale
+    //    sequence number, it is likely from a stale coordinator instance
+    //    attempting to recover, in which case the requests are fenced.
+
     auto current_pid = producer->id();
     if (pid.epoch < current_pid.epoch) {
         // request from an older instance of the producer
@@ -256,39 +274,83 @@ ss::future<checked<model::term_id, tx::errc>> rm_stm::do_begin_tx(
           synced_term, producer, std::nullopt, _sync_timeout);
         if (ar != tx::errc::none) {
             vlog(
-              _ctx_log.trace,
-              "can't begin tx {} because abort of a prev tx {} failed with {}",
+              _ctx_log.warn,
+              "[{}] can't begin tx because abort of a prev tx with lower epoch "
+              "{} failed with {}",
+              *producer,
               pid,
-              current_pid,
               ar);
             co_return tx::errc::stale;
         }
     } else if (producer->has_transaction_in_progress()) {
-        // check for duplicate request
-        if (
-          producer->transaction_state()->status
-          == tx::partition_transaction_status::initialized) {
+        const auto& tx_state = producer->transaction_state();
+        if (tx_seq < tx_state->sequence) {
             vlog(
-              _ctx_log.debug,
-              "Ignoring duplicate begin_tx request with producer: {}",
+              _ctx_log.warn,
+              "[{}] Fencing begin_tx request due to a smaller sequence "
+              "number {}",
+              *producer,
+              tx_seq);
+        } else if (tx_seq > tx_state->sequence) {
+            // this is impossible because the coordinator state machine has to
+            // ensure that a sequence is committed/aborted before bumping it.
+            vlog(
+              _ctx_log.error,
+              "[{}] can't begin tx with {} because a transaction with lower "
+              "sequence is in progress, this is likely a bug in the "
+              "coordinator",
+              *producer,
+              tx_seq);
+        } else {
+            // sequence numbers matched.
+            // check for duplicate request
+            if (
+              tx_state->status
+              == tx::partition_transaction_status::initialized) {
+                vlog(
+                  _ctx_log.debug,
+                  "Ignoring duplicate begin_tx request with producer: {}",
+                  *producer);
+                // no data yet, in the transaction ignore the duplicate
+                // request by returning success
+                co_return synced_term;
+            }
+            vlog(
+              _ctx_log.error,
+              "duplicate begin request with producer after the transaction "
+              "already "
+              "began: {}",
               *producer);
-            // no data yet, in the transaction ignore the duplicate
-            // request by returning success
-            co_return synced_term;
         }
-        vlog(
-          _ctx_log.warn,
-          "duplicate begin request with producer after the transaction already "
-          "began: {}",
-          *producer);
-        co_return tx::errc::unknown_server_error;
+        co_return tx::errc::request_rejected;
+    } else {
+        // tx sequence is monotonic and cannot move backwards.
+        // check if the request is stale i.e. tx_seq has moved forward already.
+        // we may not always have this transaction state around since producers
+        // may be evicted, so this fencing is not enforced in all times.
+        const auto& sealed_tx_state = producer->transaction_state();
+        if (sealed_tx_state && tx_seq <= sealed_tx_state->sequence) {
+            // At this point there is no transaction in progress and the
+            // requested sequence number is behind the sequence number of the
+            // transaction that is already sealed, so this is likely from an
+            // stale coordinator.
+            vlog(
+              _ctx_log.warn,
+              "[{}] Rejecting stale request with sequence number {}",
+              *producer,
+              tx_seq);
+            co_return tx::errc::request_rejected;
+        }
     }
     // By now any in progresss transactions are aborted and the resulting
     // state and the resulting changes are reflected in the producer state.
-    vassert(
-      !producer->has_transaction_in_progress(),
-      "There is an in progress transaction for producer, invalid state: {}",
-      producer);
+    if (producer->has_transaction_in_progress()) {
+        vlog(
+          _ctx_log.error,
+          "[{}] Inprogress transaction despite aborting existing transaction",
+          *producer);
+        co_return tx::errc::request_rejected;
+    }
 
     model::record_batch batch = make_fence_batch(
       pid, tx_seq, transaction_timeout_ms, tm);
@@ -315,10 +377,11 @@ ss::future<checked<model::term_id, tx::errc>> rm_stm::do_begin_tx(
           model::offset(r.value().last_offset()),
           model::timeout_clock::now() + _sync_timeout)) {
         vlog(
-          _ctx_log.trace,
-          "timeout on waiting until {} is applied (begin_tx pid:{} tx_seq:{})",
+          _ctx_log.warn,
+          "Timed out while waiting for offset {} to be applied (begin_tx "
+          "producer: {} tx_seq: {})",
           r.value().last_offset(),
-          pid,
+          *producer,
           tx_seq);
         if (_raft->is_leader() && _raft->term() == synced_term) {
             co_await _raft->step_down("begin_tx apply error");
@@ -338,12 +401,15 @@ ss::future<checked<model::term_id, tx::errc>> rm_stm::do_begin_tx(
     }
 
     const auto& tx_state = producer->transaction_state();
-    vassert(
-      tx_state && tx_state->sequence == tx_seq,
-      "Inconsistent state detected after tx begin, expected sequence: {}, from "
-      "producer: {}",
-      tx_seq,
-      *producer);
+    if (!tx_state || tx_state->sequence != tx_seq) {
+        vlog(
+          _ctx_log.error,
+          "[{}] Invalid sequence number after replicating begin, expected: {}",
+          *producer,
+          tx_seq);
+        // let the coordinator retry.
+        co_return tx::errc::timeout;
+    }
 
     co_return synced_term;
 }
@@ -357,7 +423,7 @@ ss::future<tx::errc> rm_stm::commit_tx(
         co_return tx::errc::stale;
     }
     auto synced_term = _insync_term;
-    auto producer = maybe_create_producer(pid);
+    auto [producer, _] = maybe_create_producer(pid);
     if (pid != producer->id()) {
         co_return tx::errc::fenced;
     }
@@ -394,13 +460,25 @@ ss::future<tx::errc> rm_stm::do_commit_tx(
             // Already committed request
             co_return tx::errc::none;
         }
+        // At this point we do not have any trace of the transaction with
+        // required sequence. This is possible only when the transaction has
+        // been sealed (committed/aborted) as we do not evict in progress
+        // transaction state. The state could've been GC-ed along with the
+        // producer or there are edge cases like upgrading from snapshot
+        // v5 -> v6 that does not preserve sealed transactions (rare edge
+        // case only relevant during upgrades).
+        //
+        // It can only be committed because the commit_tx request from the
+        // coordinator originates if the transaction has been marked prepared
+        // in the coordinator log, so the only way it would have been sealed
+        // already is with another commit request and this is a replay.
         vlog(
-          _ctx_log.warn,
-          "No in progress transaction {} while attempting to commit "
-          "sequence: {}",
+          _ctx_log.info,
+          "No in progress transaction {} while attempting to (replay) commit "
+          "sequence: {}, assuming committed.",
           *producer,
           expected_tx_seq);
-        co_return tx::errc::invalid_txn_state;
+        co_return tx::errc::none;
     }
     auto transaction_sequence = producer->transaction_state()->sequence;
     if (transaction_sequence > expected_tx_seq) {
@@ -441,6 +519,13 @@ ss::future<tx::errc> rm_stm::do_commit_tx(
     }
     if (!co_await wait_no_throw(
           r.value().last_offset, model::timeout_clock::now() + timeout)) {
+        vlog(
+          _ctx_log.warn,
+          "Timed out while waiting for commit marker at offset {} to be "
+          "applied (commit_tx producer: {} tx_seq: {})",
+          r.value().last_offset,
+          *producer,
+          expected_tx_seq);
         if (_raft->is_leader() && _raft->term() == synced_term) {
             co_await _raft->step_down("do_commit_tx wait error");
         }
@@ -480,7 +565,7 @@ ss::future<tx::errc> rm_stm::abort_tx(
         co_return tx::errc::stale;
     }
     auto synced_term = _insync_term;
-    auto producer = maybe_create_producer(pid);
+    auto [producer, _] = maybe_create_producer(pid);
     if (pid != producer->id()) {
         co_return cluster::errc::invalid_producer_epoch;
     }
@@ -576,7 +661,7 @@ ss::future<tx::errc> rm_stm::do_abort_tx(
 
     if (!r) {
         vlog(
-          _ctx_log.info,
+          _ctx_log.warn,
           "Error \"{}\" on replicating pid:{} tx_seq:{} abort batch",
           r.error(),
           pid,
@@ -590,10 +675,11 @@ ss::future<tx::errc> rm_stm::do_abort_tx(
     if (!co_await wait_no_throw(
           r.value().last_offset, model::timeout_clock::now() + timeout)) {
         vlog(
-          _ctx_log.trace,
-          "timeout on waiting until {} is applied (abort_tx pid:{} tx_seq:{})",
+          _ctx_log.warn,
+          "Timed out while waiting for offset {} to be applied (abort_tx "
+          "producer: {} tx_seq: {})",
           r.value().last_offset,
-          pid,
+          *producer,
           expected_tx_seq.value_or(model::tx_seq(-1)));
         if (_raft->is_leader() && _raft->term() == synced_term) {
             co_await _raft->step_down("abort_tx apply error");
@@ -681,10 +767,13 @@ ss::future<result<partition_transactions>> rm_stm::get_transactions() {
     partition_transactions ans;
     for (auto& producer : _active_tx_producers) {
         const auto& tx_state = producer.transaction_state();
-        vassert(
-          tx_state,
-          "Invalid transactional state_tracking for producer: {}",
-          producer);
+        if (!tx_state) {
+            vlog(
+              _ctx_log.error,
+              "No transaction state for active producer: {}",
+              producer);
+            continue;
+        }
         partition_transaction_info tx_info;
         tx_info.lso_bound = tx_state->first;
         tx_info.status = tx_state->status;
@@ -796,10 +885,11 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
       synced_term, std::move(rdr), make_replicate_options());
     if (!r) {
         vlog(
-          _ctx_log.info,
-          "got {} on replicating tx data batch for pid:{}",
+          _ctx_log.warn,
+          "Error {} on replicating tx data batch for bid:{}, producer: {}",
           r.error(),
-          bid.pid);
+          bid,
+          *producer);
         req_ptr->set_error(r.error());
         co_return r.error();
     }
@@ -808,8 +898,11 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
           model::timeout_clock::now() + _sync_timeout)) {
         vlog(
           _ctx_log.warn,
-          "application of the replicated tx batch has timed out pid:{}",
-          bid.pid);
+          "Timed out while waiting for offset: {}, batch: {} to be applied "
+          "using producer: {}",
+          r.value().last_offset,
+          bid,
+          *producer);
         req_ptr->set_error(cluster::errc::timeout);
         co_return tx::errc::timeout;
     }
@@ -832,7 +925,7 @@ ss::future<result<kafka_result>> rm_stm::transactional_replicate(
         co_return cluster::errc::not_leader;
     }
     auto synced_term = _insync_term;
-    auto producer = maybe_create_producer(bid.pid);
+    auto [producer, _] = maybe_create_producer(bid.pid);
     co_return co_await producer->run_with_lock(
       [&, synced_term](ssx::semaphore_units units) {
           return do_transactional_replicate(
@@ -848,7 +941,8 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
   model::record_batch_reader br,
   raft::replicate_options opts,
   ss::lw_shared_ptr<available_promise<>> enqueued,
-  ssx::semaphore_units units) {
+  ssx::semaphore_units units,
+  producer_previously_known producer_known) {
     auto result = co_await do_idempotent_replicate(
       synced_term,
       producer,
@@ -856,7 +950,8 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
       std::move(br),
       opts,
       std::move(enqueued),
-      units);
+      units,
+      producer_known);
 
     if (!result) {
         vlog(
@@ -899,8 +994,31 @@ ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
   model::record_batch_reader br,
   raft::replicate_options opts,
   ss::lw_shared_ptr<available_promise<>> enqueued,
-  ssx::semaphore_units& units) {
-    auto request = producer->try_emplace_request(bid, synced_term);
+  ssx::semaphore_units& units,
+  producer_previously_known known_producer) {
+    // Check if the producer bumped the epoch and reset accordingly.
+    if (bid.pid.epoch > producer->id().epoch()) {
+        producer->reset_with_new_epoch(bid.pid.epoch);
+    }
+    // If the producer is unknown and is producing with a non zero
+    // sequence number, it is possible that the producer has been evicted
+    // from the broker memory. Instead of rejecting the request, we accept
+    // the current sequence and move on. This logic is similar to what
+    // Apache Kafka does.
+    // Ref:
+    // https://github.com/apache/kafka/blob/704476885ffb40cd3bf9b8f5c368c01eaee0a737
+    // storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L135
+    auto skip_sequence_checks = !known_producer && bid.first_seq > 0;
+    if (unlikely(skip_sequence_checks)) {
+        vlog(
+          _ctx_log.warn,
+          "Accepting batch from unknown producer that likely got evicted: {}, "
+          "term: {}",
+          bid,
+          synced_term);
+    }
+    auto request = producer->try_emplace_request(
+      bid, synced_term, skip_sequence_checks);
     if (!request) {
         co_return request.error();
     }
@@ -957,9 +1075,9 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
     }
     try {
         auto synced_term = _insync_term;
-        auto producer = maybe_create_producer(bid.pid);
+        auto [producer, known_producer] = maybe_create_producer(bid.pid);
         co_return co_await producer->run_with_lock(
-          [&](ssx::semaphore_units units) {
+          [&, known_producer](ssx::semaphore_units units) {
               return idempotent_replicate(
                 synced_term,
                 producer,
@@ -967,7 +1085,8 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
                 std::move(br),
                 opts,
                 std::move(enqueued),
-                std::move(units));
+                std::move(units),
+                known_producer);
           });
     } catch (const cache_full_error& e) {
         vlog(
@@ -1033,11 +1152,15 @@ model::offset rm_stm::last_stable_offset() {
     if (_is_tx_enabled && !_active_tx_producers.empty()) {
         const auto& earliest_open_tx_producer = _active_tx_producers.begin();
         const auto& tx_state = earliest_open_tx_producer->transaction_state();
-        vassert(
-          tx_state,
-          "invalid transaction state tracking: {}",
-          *earliest_open_tx_producer);
-        first_tx_start = tx_state->first;
+        if (tx_state) {
+            first_tx_start = tx_state->first;
+        } else {
+            vlog(
+              _ctx_log.error,
+              "[{}] Invalid transaction state for transactional producer, lso "
+              "may be incorrect",
+              *earliest_open_tx_producer);
+        }
     }
 
     auto synced_leader = _raft->is_leader() && _raft->term() == _insync_term;
@@ -1170,18 +1293,22 @@ rm_stm::get_expired_producers() const {
       = std::chrono::milliseconds::max();
     for (const auto& producer : _active_tx_producers) {
         auto it = _producers.find(producer.id().get_id());
-        vassert(
-          it != _producers.end(),
-          "No entry for {} in _producers, incorrect state tracking",
-          producer);
+        if (it == _producers.end()) {
+            vlog(
+              _ctx_log.error, "No producer entry for {}, ignoring", producer);
+            continue;
+        }
         if (producer.has_transaction_expired()) {
             result.push_back(it->second);
         } else {
             const auto& tx_state = producer.transaction_state();
-            vassert(
-              tx_state,
-              "No transaction state for in progress transaction: {}",
-              producer);
+            if (!tx_state) {
+                vlog(
+                  _ctx_log.error,
+                  "No transaction state for active producer: {}",
+                  producer);
+                continue;
+            }
             auto ms_to_expire = tx_state->timeout_ms()
                                 - producer.ms_since_last_update();
             min_pending_expiration = std::min(
@@ -1193,7 +1320,8 @@ rm_stm::get_expired_producers() const {
       "expired producers: {}, next expiration duration ms: {}",
       result.size(),
       min_pending_expiration.count());
-    return std::make_pair(std::move(result), min_pending_expiration);
+    return std::make_pair(
+      std::move(result), std::max(min_pending_expiration, 200ms));
 }
 
 ss::future<std::chrono::milliseconds> rm_stm::do_abort_old_txes() {
@@ -1228,6 +1356,7 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
     const auto& tx_state = producer->transaction_state();
 
     if (!tx_state || !producer->has_transaction_expired()) {
+        vlog(_ctx_log.debug, "[{}] no transaction to expire", *producer);
         co_return tx::errc::stale;
     }
 
@@ -1268,9 +1397,10 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
                       model::timeout_clock::now() + _sync_timeout)) {
                     vlog(
                       _ctx_log.warn,
-                      "Timed out on waiting for the commit marker to be "
-                      "applied pid:{} tx_seq:{}",
-                      pid,
+                      "Timed out while waiting for the commit marker at offset "
+                      "{} to be applied using producer: {} tx_seq: {}",
+                      cr.value().last_offset,
+                      *producer,
                       tx_seq);
                     if (_raft->is_leader() && _raft->term() == synced_term) {
                         co_await _raft->step_down(
@@ -1309,8 +1439,9 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
                       model::timeout_clock::now() + _sync_timeout)) {
                     vlog(
                       _ctx_log.warn,
-                      "Timed out on waiting for the abort marker to be applied "
-                      "for transaction: {}",
+                      "Timed out while waiting for the abort marker at offset: "
+                      "{} to be applied for transaction: {}",
+                      cr.value().last_offset,
                       *producer);
                     if (_raft->is_leader() && _raft->term() == synced_term) {
                         co_await _raft->step_down(
@@ -1358,11 +1489,11 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
               model::offset(cr.value().last_offset()),
               model::timeout_clock::now() + _sync_timeout)) {
             vlog(
-              _ctx_log.trace,
-              "timeout on waiting until {} is applied (try_abort_old_tx "
-              "pid:{})",
+              _ctx_log.warn,
+              "Timed out while waiting for offset {} to be applied "
+              "(try_abort_old_tx producer: {})",
               cr.value().last_offset(),
-              pid);
+              *producer);
             if (_raft->is_leader() && _raft->term() == synced_term) {
                 co_await _raft->step_down("try_abort_old_tx apply error");
             }
@@ -1382,7 +1513,7 @@ void rm_stm::maybe_rearm_autoabort_timer(time_point_type deadline) {
 }
 
 void rm_stm::apply_fence(model::producer_identity pid, model::record_batch b) {
-    auto producer = maybe_create_producer(pid);
+    auto [producer, _] = maybe_create_producer(pid);
     auto header = b.header();
     auto batch_data = read_fence_batch(std::move(b));
     vlog(
@@ -1401,7 +1532,7 @@ void rm_stm::apply_fence(model::producer_identity pid, model::record_batch b) {
     _producer_state_manager.local().touch(*producer, _vcluster_id);
 }
 
-ss::future<> rm_stm::apply(const model::record_batch& b) {
+ss::future<> rm_stm::do_apply(const model::record_batch& b) {
     const auto& hdr = b.header();
     const auto bid = model::batch_identity::from(hdr);
 
@@ -1431,7 +1562,7 @@ void rm_stm::apply_control(
   model::producer_identity pid, model::control_record_type crt) {
     vlog(
       _ctx_log.trace, "applying control batch of type {}, pid: {}", crt, pid);
-    auto producer = maybe_create_producer(pid);
+    auto [producer, _] = maybe_create_producer(pid);
     auto tx_range = producer->apply_transaction_end(crt);
     if (tx_range && crt == model::control_record_type::tx_abort) {
         // Aborted transaction
@@ -1452,12 +1583,14 @@ void rm_stm::apply_control(
         // the producer may be unlinked if only the abort batch is retained
         // from the transaction and everything else got truncated.
         auto it = _active_tx_producers.iterator_to(*producer);
-        vassert(
-          it != _active_tx_producers.end(),
-          "Invalid transacation state tracking, {} is not in active producers "
-          "list",
-          *producer);
-        _active_tx_producers.erase(it);
+        if (it != _active_tx_producers.end()) {
+            _active_tx_producers.erase(it);
+        } else {
+            vlog(
+              _ctx_log.error,
+              "[{}] not tracked under active transactions list",
+              *producer);
+        }
     }
     _highest_producer_id = std::max(_highest_producer_id, pid.get_id());
 }
@@ -1479,7 +1612,7 @@ void rm_stm::apply_data(
     if (bid.is_idempotent()) {
         _highest_producer_id = std::max(_highest_producer_id, bid.pid.get_id());
         const auto last_kafka_offset = from_log_offset(header.last_offset());
-        auto producer = maybe_create_producer(bid.pid);
+        auto [producer, _] = maybe_create_producer(bid.pid);
         producer->apply_data(header, last_kafka_offset);
         _producer_state_manager.local().touch(*producer, _vcluster_id);
         if (
@@ -1526,8 +1659,8 @@ rm_stm::apply_local_snapshot(raft::stm_snapshot_header hdr, iobuf&& tx_ss_buf) {
     } else if (hdr.version == tx_snapshot_v6::version) {
         data = co_await serde::read_async<tx_snapshot_v6>(data_parser);
     } else {
-        vassert(
-          false, "unsupported tx_snapshot_header version {}", hdr.version);
+        vlog(_ctx_log.error, "Ignored snapshot version {}", hdr.version);
+        co_return;
     }
 
     _highest_producer_id = std::max(
@@ -1621,36 +1754,14 @@ uint8_t rm_stm::active_snapshot_version() {
     return tx_snapshot_v5::version;
 }
 
-ss::future<> rm_stm::offload_aborted_txns() {
-    // Note: this method requires a consistent view of aborted state
-    // make sure to call this under _state_lock.write_lock()
-    std::sort(
-      std::begin(_aborted_tx_state.aborted),
-      std::end(_aborted_tx_state.aborted),
-      [](tx_range a, tx_range b) { return a.first < b.first; });
-
-    abort_snapshot snapshot{
-      .first = model::offset::max(), .last = model::offset::min()};
-    for (auto const& entry : _aborted_tx_state.aborted) {
-        snapshot.first = std::min(snapshot.first, entry.first);
-        snapshot.last = std::max(snapshot.last, entry.last);
-        snapshot.aborted.push_back(entry);
-        if (snapshot.aborted.size() == _abort_index_segment_size) {
-            auto idx = abort_index{snapshot.first, snapshot.last};
-            _aborted_tx_state.abort_indexes.push_back(idx);
-            co_await save_abort_snapshot(std::move(snapshot));
-            snapshot = abort_snapshot{
-              .first = model::offset::max(), .last = model::offset::min()};
-        }
-    }
-    _aborted_tx_state.aborted = std::move(snapshot.aborted);
+ss::future<raft::stm_snapshot>
+rm_stm::take_local_snapshot(ssx::semaphore_units apply_units) {
+    return do_take_local_snapshot(
+      active_snapshot_version(), std::move(apply_units));
 }
 
-ss::future<raft::stm_snapshot> rm_stm::take_local_snapshot() {
-    return do_take_local_snapshot(active_snapshot_version());
-}
-
-ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(uint8_t version) {
+ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(
+  uint8_t version, ssx::semaphore_units apply_units) {
     vassert(
       version == tx_snapshot_v5::version || version == tx_snapshot_v6::version,
       "Unsupported snapshot version requested: {}",
@@ -1662,11 +1773,14 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(uint8_t version) {
       "taking snapshot with last included offset of: {}",
       last_applied_offset());
 
-    // Get rid of any aborted transactions state, from the part of the log
-    // that was prefix truncated.
-    fragmented_vector<abort_index> abort_indexes;
+    // all the operations during snapshot creation are made against the two
+    // local variables, after all garbage collection is done the internal stm
+    // state is updated.
+    fragmented_vector<abort_index> final_abort_indexes;
     fragmented_vector<abort_index> expired_abort_indexes;
 
+    // first, check if there are any indicies and aborted ranges to drop.
+    // whatever is there to retain is moved to the `final_` local variables.
     for (const auto& idx : _aborted_tx_state.abort_indexes) {
         if (idx.last < start_offset) {
             // caching expired indexes instead of removing them as we go
@@ -1674,53 +1788,71 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(uint8_t version) {
             // concurrent access to _log_state.abort_indexes
             expired_abort_indexes.push_back(idx);
         } else {
-            abort_indexes.push_back(idx);
+            final_abort_indexes.push_back(idx);
         }
     }
-    _aborted_tx_state.abort_indexes = std::move(abort_indexes);
 
-    vlog(
-      _ctx_log.debug,
-      "Removing abort indexes {} with offset < {}",
-      expired_abort_indexes.size(),
-      start_offset);
-
-    co_await ss::max_concurrent_for_each(
-      expired_abort_indexes.begin(),
-      expired_abort_indexes.end(),
-      64,
-      [this](const abort_index& idx) {
-          auto f_name = abort_idx_name(idx.first, idx.last);
-          vlog(
-            _ctx_log.debug,
-            "removing aborted transactions {} snapshot file",
-            f_name);
-          _abort_snapshot_sizes.erase(std::make_pair(idx.first, idx.last));
-          return _abort_snapshot_mgr.remove_snapshot(f_name);
-      });
-
-    fragmented_vector<tx_range> aborted;
+    fragmented_vector<tx::tx_range> preserved_aborted_ranges;
+    // remove obsolete aborted ranges, this doesn't influence correctness as
+    // logs start offset already advanced past those ranges.
     std::copy_if(
       _aborted_tx_state.aborted.begin(),
       _aborted_tx_state.aborted.end(),
-      std::back_inserter(aborted),
-      [start_offset](tx_range range) { return range.last >= start_offset; });
-    _aborted_tx_state.aborted = std::move(aborted);
+      std::back_inserter(preserved_aborted_ranges),
+      [start_offset](const tx_range& range) {
+          return range.last >= start_offset;
+      });
+
+    _aborted_tx_state.aborted = std::move(preserved_aborted_ranges);
+    // check if any of the aborted ranges have to be offloaded to the snapshots.
+    chunked_vector<abort_snapshot> aborted_snapshots;
+    // store ranges that are going to be included in aborted transaction
+    // snapshots.
+    chunked_hash_set<tx_range> ranges_offloaded_to_abort_snapshots;
+    const auto snapshot_offset = last_applied_offset();
+    tx::tx_snapshot_v6 stm_snapshot;
 
     if (_aborted_tx_state.aborted.size() > _abort_index_segment_size) {
-        // There is nested locking here. Snapshot is done under
-        // persisted_stm::_op_lock and we grab a write lock to stop all the
-        // writers to aborted state to have a consistent snpahot to offload.
-        // Ensure this order is not violated in other places to avoid a
-        // deadlock.
-        auto units = co_await _state_lock.hold_write_lock();
-        co_await offload_aborted_txns();
+        std::sort(
+          _aborted_tx_state.aborted.begin(),
+          _aborted_tx_state.aborted.end(),
+          [](const tx_range& a, const tx_range& b) {
+              return a.first < b.first;
+          });
+
+        model::offset first = model::offset::max();
+        model::offset last = model::offset::min();
+        fragmented_vector<tx::tx_range> aborted_ranges;
+
+        for (auto const& entry : _aborted_tx_state.aborted) {
+            first = std::min(first, entry.first);
+            last = std::max(last, entry.last);
+            aborted_ranges.push_back(entry);
+
+            if (aborted_ranges.size() >= _abort_index_segment_size) {
+                // max snapshot size reached, take snapshot and update indexes.
+                for (auto& r : aborted_ranges) {
+                    ranges_offloaded_to_abort_snapshots.emplace(r);
+                }
+                aborted_snapshots.push_back(abort_snapshot{
+                  .first = first,
+                  .last = last,
+                  .aborted = std::move(aborted_ranges)});
+                final_abort_indexes.emplace_back(first, last);
+                // reset the current state
+                first = model::offset::max();
+                last = model::offset::min();
+                aborted_ranges = {};
+            }
+        }
+        // everything that left ends up in snapshot
+        stm_snapshot.aborted = std::move(aborted_ranges);
+    } else {
+        stm_snapshot.aborted = _aborted_tx_state.aborted.copy();
     }
+
+    stm_snapshot.abort_indexes = final_abort_indexes.copy();
     kafka::offset start_kafka_offset = from_log_offset(start_offset);
-    tx::tx_snapshot_v6 stm_snapshot;
-    // aborted transactions state.
-    stm_snapshot.abort_indexes = _aborted_tx_state.abort_indexes.copy();
-    stm_snapshot.aborted = _aborted_tx_state.aborted.copy();
     stm_snapshot.highest_producer_id = _highest_producer_id;
     // producers state (includes idempotent and transactional producers)
     for (const auto& [_, state] : _producers) {
@@ -1730,8 +1862,58 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(uint8_t version) {
         }
     }
 
-    vlog(_ctx_log.trace, "Serializing snapshot {}", stm_snapshot);
+    apply_units.return_all();
 
+    co_await ss::max_concurrent_for_each(
+      std::move(aborted_snapshots), 64, [this](abort_snapshot& snapshot) {
+          return save_abort_snapshot(std::move(snapshot));
+      });
+
+    _aborted_tx_state.abort_indexes = std::move(final_abort_indexes);
+    fragmented_vector<tx::tx_range> cleaned_aborted_ranges;
+    cleaned_aborted_ranges.reserve(_aborted_tx_state.aborted.size());
+    // preserve those aborted ranges which were not included in the snapshot
+    std::copy_if(
+      _aborted_tx_state.aborted.begin(),
+      _aborted_tx_state.aborted.end(),
+      std::back_inserter(cleaned_aborted_ranges),
+      [&ranges_offloaded_to_abort_snapshots](const tx_range& range) {
+          // only preserve ranges that were not included in the snapshot
+          return !ranges_offloaded_to_abort_snapshots.contains(range);
+      });
+    vlog(
+      _ctx_log.debug,
+      "Preserved {} aborted transaction ranges",
+      cleaned_aborted_ranges.size());
+    _aborted_tx_state.aborted = std::move(cleaned_aborted_ranges);
+
+    if (!expired_abort_indexes.empty()) {
+        vlog(
+          _ctx_log.debug,
+          "Removing {} expired aborted indexes with offsets smaller than {}",
+          expired_abort_indexes.size(),
+          start_offset);
+    }
+    co_await ss::max_concurrent_for_each(
+      expired_abort_indexes.begin(),
+      expired_abort_indexes.end(),
+      64,
+      [this](const abort_index& idx) {
+          auto f_name = abort_idx_name(idx.first, idx.last);
+          vlog(
+            _ctx_log.debug,
+            "removing aborted transactions snapshot file: {}",
+            f_name);
+          return _abort_snapshot_mgr.remove_snapshot(f_name).then(
+            [this, key = std::make_pair(idx.first, idx.last)] {
+                _abort_snapshot_sizes.erase(key);
+            });
+      });
+    vlog(
+      _ctx_log.trace,
+      "Serializing snapshot {} at offset: {}",
+      stm_snapshot,
+      snapshot_offset);
     iobuf snapshot_buf;
     if (version == tx_snapshot_v6::version) {
         co_await serde::write_async(snapshot_buf, std::move(stm_snapshot));
@@ -1741,7 +1923,7 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(uint8_t version) {
     }
 
     co_return raft::stm_snapshot::create(
-      version, last_applied_offset(), std::move(snapshot_buf));
+      version, snapshot_offset, std::move(snapshot_buf));
 }
 
 uint64_t rm_stm::get_local_snapshot_size() const {

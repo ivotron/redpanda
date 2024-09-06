@@ -10,11 +10,11 @@
  */
 
 #pragma once
-#include "archival/types.h"
 #include "cloud_roles/types.h"
 #include "cloud_storage/configuration.h"
 #include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage_clients/configuration.h"
+#include "cluster/archival/types.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/controller.h"
 #include "cluster/controller_stm.h"
@@ -319,7 +319,6 @@ public:
         cconf.client_config = s3conf;
         cconf.bucket_name = cloud_storage_clients::bucket_name("test-bucket");
         cconf.connection_limit = archival::connection_limit(4);
-        cconf.metrics_disabled = cloud_storage::remote_metrics_disabled::yes;
         return cconf;
     }
 

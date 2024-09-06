@@ -13,8 +13,11 @@
 
 #include "cluster/cloud_metadata/cluster_manifest.h"
 #include "cluster/errc.h"
+#include "cluster/feature_update_action.h"
 #include "cluster/fwd.h"
+#include "cluster/nt_revision.h"
 #include "cluster/remote_topic_properties.h"
+#include "cluster/snapshot.h"
 #include "cluster/topic_configuration.h"
 #include "cluster/topic_properties.h"
 #include "cluster/tx_errc.h"
@@ -36,7 +39,15 @@
 #include "security/role.h"
 #include "security/scram_credential.h"
 #include "security/types.h"
-#include "serde/envelope.h"
+#include "serde/rw/bool_class.h"
+#include "serde/rw/chrono.h"
+#include "serde/rw/enum.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/inet_address.h"
+#include "serde/rw/map.h"
+#include "serde/rw/named_type.h"
+#include "serde/rw/sstring.h"
+#include "serde/rw/vector.h"
 #include "storage/ntp_config.h"
 #include "utils/tristate.h"
 #include "v8_engine/data_policy.h"
@@ -771,7 +782,7 @@ struct create_partitions_configuration
     // This is new total number of partitions in topic.
     int32_t new_total_partition_count;
 
-    // TODO: use when we will start supporting custom partitions assignment
+    // TODO: use when we start supporting custom partitions assignment
     std::vector<custom_assignment> custom_assignments;
 
     friend bool operator==(
@@ -867,6 +878,9 @@ enum class topic_lifecycle_transition_mode : uint8_t {
     // Legacy-style deletion, where we attempt to delete local data and drop
     // the topic entirely from the topic table in one step.
     oneshot_delete = 2,
+
+    // Local-only delete for migrated-from topics
+    delete_migrated = 3
 };
 
 struct nt_lifecycle_marker
@@ -882,45 +896,6 @@ struct nt_lifecycle_marker
 
     // Note that the serialisation of `timestamp` is explicitly avoided.
     auto serde_fields() { return std::tie(config, initial_revision_id); }
-};
-
-/**
- * The namespace-topic-revision tuple refers to a particular incarnation
- * of a named topic.  For topic lifecycle markers,
- */
-struct nt_revision
-  : serde::envelope<nt_revision, serde::version<0>, serde::compat_version<0>> {
-    model::topic_namespace nt;
-
-    // The initial revision ID of partition 0.
-    model::initial_revision_id initial_revision_id;
-
-    template<typename H>
-    friend H AbslHashValue(H h, const nt_revision& ntr) {
-        return H::combine(std::move(h), ntr.nt, ntr.initial_revision_id);
-    }
-
-    friend bool operator==(const nt_revision& lhs, const nt_revision& rhs);
-    friend std::ostream& operator<<(std::ostream&, const nt_revision&);
-
-    auto serde_fields() { return std::tie(nt, initial_revision_id); }
-};
-
-struct nt_revision_hash {
-    using is_transparent = void;
-
-    size_t operator()(const nt_revision& v) const {
-        return absl::Hash<nt_revision>{}(v);
-    }
-};
-
-struct nt_revision_eq {
-    using is_transparent = void;
-
-    bool operator()(const nt_revision& lhs, const nt_revision& rhs) const {
-        return lhs.nt == rhs.nt
-               && lhs.initial_revision_id == rhs.initial_revision_id;
-    }
 };
 
 struct topic_lifecycle_transition
@@ -1537,37 +1512,6 @@ struct cluster_config_status_cmd_data
     auto serde_fields() { return std::tie(status); }
 
     config_status status;
-};
-
-struct feature_update_action
-  : serde::envelope<
-      feature_update_action,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    static constexpr int8_t current_version = 1;
-    enum class action_t : std::uint16_t {
-        // Notify when a feature is done with preparing phase
-        complete_preparing = 1,
-        // Notify when a feature is made available, either by an administrator
-        // or via auto-activation policy
-        activate = 2,
-        // Notify when a feature is explicitly disabled by an administrator
-        deactivate = 3
-    };
-
-    // Features have an internal bitflag representation, but it is not
-    // meant to be stable for use on the wire, so we refer to features by name
-    ss::sstring feature_name;
-    action_t action;
-
-    friend bool
-    operator==(const feature_update_action&, const feature_update_action&)
-      = default;
-
-    auto serde_fields() { return std::tie(feature_name, action); }
-
-    friend std::ostream&
-    operator<<(std::ostream&, const feature_update_action&);
 };
 
 struct feature_update_cmd_data
@@ -3192,6 +3136,8 @@ struct controller_committed_offset_request
       serde::version<0>,
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
+
+    auto serde_fields() { return std::tie(); }
 };
 
 struct controller_committed_offset_reply
@@ -3216,13 +3162,6 @@ std::ostream& operator<<(
       with_assignment.assignments);
     return o;
 }
-
-/// Names of snapshot files used by stm's
-static const ss::sstring archival_stm_snapshot = "archival_metadata.snapshot";
-static const ss::sstring rm_stm_snapshot = "tx.snapshot";
-static const ss::sstring tm_stm_snapshot = "tx.coordinator.snapshot";
-static const ss::sstring id_allocator_snapshot = "id.snapshot";
-static const ss::sstring tx_registry_snapshot = "tx_registry.snapshot";
 
 /**
  * Create/update a (Wasm) plugin.

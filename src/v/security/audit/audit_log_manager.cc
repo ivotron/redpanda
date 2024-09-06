@@ -18,7 +18,7 @@
 #include "kafka/client/config_utils.h"
 #include "kafka/protocol/produce.h"
 #include "kafka/protocol/schemata/produce_response.h"
-#include "kafka/server/handlers/topics/types.h"
+#include "kafka/protocol/topic_properties.h"
 #include "model/namespace.h"
 #include "security/acl.h"
 #include "security/audit/client_probe.h"
@@ -391,7 +391,10 @@ ss::future<> audit_client::create_internal_topic() {
           .value{retain_forever}},
         kafka::createable_topic_config{
           .name = ss::sstring(kafka::topic_property_retention_duration),
-          .value{seven_days}}}};
+          .value{seven_days}},
+        kafka::createable_topic_config{
+          .name = ss::sstring(kafka::topic_property_cleanup_policy),
+          .value = "delete"}}};
     vlog(
       adtlog.info, "Creating audit log topic with settings: {}", audit_topic);
     const auto resp = co_await _client.create_topic({std::move(audit_topic)});

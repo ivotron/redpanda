@@ -27,6 +27,7 @@ enum class find_topic_manifest_outcome {
     // and a hint must be provided to determine winner.
     multiple_matching_manifests,
 };
+std::ostream& operator<<(std::ostream&, find_topic_manifest_outcome);
 
 // Encapsulates downloading manifests for a given topic.
 //
@@ -45,7 +46,7 @@ public:
     topic_manifest_downloader(
       const cloud_storage_clients::bucket_name bucket,
       std::optional<ss::sstring> hint,
-      const model::topic_namespace topoic,
+      const model::topic_namespace topic,
       remote& remote);
 
     // Attempts to download the topic manifest, transparently checking paths

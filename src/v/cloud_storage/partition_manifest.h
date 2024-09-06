@@ -19,8 +19,7 @@
 #include "model/record.h"
 #include "model/timestamp.h"
 #include "segment_meta_cstore.h"
-#include "serde/envelope.h"
-#include "serde/serde.h"
+#include "serde/rw/envelope.h"
 #include "utils/tracking_allocator.h"
 
 #include <seastar/core/iostream.hh>
@@ -90,6 +89,17 @@ public:
         size_t size_bytes;
 
         segment_name_format sname_format{segment_name_format::v1};
+
+        auto serde_fields() {
+            return std::tie(
+              ntp_revision,
+              base_offset,
+              committed_offset,
+              archiver_term,
+              segment_term,
+              size_bytes,
+              sname_format);
+        }
 
         auto operator<=>(const lw_segment_meta&) const = default;
 
@@ -264,6 +274,9 @@ public:
     // manifest, or 0 if the memory is not being tracked.
     size_t segments_metadata_bytes() const;
 
+    // Return very rough estimate of the size of the serialized manifest
+    size_t estimate_serialized_size() const;
+
     /// Return map that contains spillover manifests.
     /// It stores 'segment_meta' objects but the meaning of fields are
     /// different.
@@ -430,7 +443,7 @@ public:
     /// Serialize manifest object
     ///
     /// \return asynchronous input_stream with the serialized json
-    ss::future<serialized_data_stream> serialize() const override;
+    ss::future<iobuf> serialize_buf() const override;
 
     /// Serialize manifest object
     ///

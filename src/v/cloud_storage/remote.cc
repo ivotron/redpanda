@@ -183,6 +183,9 @@ int remote::delete_objects_max_keys() const {
     switch (_cloud_storage_backend) {
     case model::cloud_storage_backend::aws:
         [[fallthrough]];
+    case model::cloud_storage_backend::oracle_s3_compat:
+        // https://docs.oracle.com/en-us/iaas/api/#/en/s3objectstorage/20160918/Object/BulkDelete
+        [[fallthrough]];
     case model::cloud_storage_backend::minio:
         // https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
         return 1000;
@@ -277,6 +280,9 @@ ss::future<download_result> remote::do_download_manifest(
                 case manifest_type::spillover:
                     _probe.spillover_manifest_download();
                     break;
+                case manifest_type::topic_mount:
+                    _probe.topic_mount_manifest_download();
+                    break;
                 }
                 co_return download_result::success;
             } catch (...) {
@@ -303,6 +309,8 @@ ss::future<download_result> remote::do_download_manifest(
               retry_permit.delay, fib.root_abort_source());
             retry_permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::fail:
             result = download_result::failed;
             vlog(
@@ -381,6 +389,9 @@ ss::future<upload_result> remote::upload_manifest(
             case manifest_type::spillover:
                 _probe.spillover_manifest_upload();
                 break;
+            case manifest_type::topic_mount:
+                _probe.topic_mount_manifest_upload();
+                break;
             }
             _probe.register_upload_size(size);
             co_return upload_result::success;
@@ -401,6 +412,8 @@ ss::future<upload_result> remote::upload_manifest(
             co_await ss::sleep_abortable(permit.delay, fib.root_abort_source());
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::key_not_found:
             // not expected during upload
             [[fallthrough]];
@@ -463,7 +476,7 @@ ss::future<upload_result> remote::upload_controller_snapshot(
   retry_chain_node& parent,
   lazy_abort_source& lazy_abort_source) {
     auto reset_str = [&file] {
-        using provider_t = std::unique_ptr<storage::stream_provider>;
+        using provider_t = std::unique_ptr<stream_provider>;
         ss::file_input_stream_options opts;
         return ss::make_ready_future<provider_t>(
           std::make_unique<storage::segment_reader_handle>(
@@ -575,6 +588,8 @@ ss::future<upload_result> remote::upload_stream(
             }
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::key_not_found:
             // not expected during upload
             [[fallthrough]];
@@ -757,6 +772,8 @@ ss::future<download_result> remote::download_stream(
             co_await ss::sleep_abortable(permit.delay, fib.root_abort_source());
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::fail:
             result = download_result::failed;
             break;
@@ -833,7 +850,7 @@ remote::download_object(cloud_storage::download_request download_request) {
             .is_retry = fib.retry_count() > 1},
           transfer_details.parent_rtc);
         auto resp = co_await lease.client->get_object(
-          bucket, path, fib.get_timeout());
+          bucket, path, fib.get_timeout(), download_request.expect_missing);
 
         if (resp) {
             vlog(ctxlog.debug, "Receive OK response from {}", path);
@@ -860,6 +877,8 @@ remote::download_object(cloud_storage::download_request download_request) {
             co_await ss::sleep_abortable(permit.delay, fib.root_abort_source());
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::fail:
             result = download_result::failed;
             break;
@@ -931,6 +950,8 @@ ss::future<download_result> remote::object_exists(
             co_await ss::sleep_abortable(permit.delay, fib.root_abort_source());
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::fail:
             result = download_result::failed;
             break;
@@ -1013,6 +1034,8 @@ ss::future<upload_result> remote::delete_object(
             co_await ss::sleep_abortable(permit.delay, fib.root_abort_source());
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::fail:
             result = upload_result::failed;
             break;
@@ -1172,6 +1195,8 @@ ss::future<upload_result> remote::delete_object_batch(
             co_await ss::sleep_abortable(permit.delay, _as);
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::fail:
             result = upload_result::failed;
             break;
@@ -1384,6 +1409,8 @@ ss::future<remote::list_result> remote::list_objects(
             co_await ss::sleep_abortable(permit.delay, _as);
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::fail:
             result = cloud_storage_clients::error_outcome::fail;
             break;
@@ -1444,7 +1471,8 @@ ss::future<upload_result> remote::upload_object(upload_request upload_request) {
           path,
           content_length,
           make_iobuf_input_stream(std::move(to_upload)),
-          fib.get_timeout());
+          fib.get_timeout(),
+          upload_request.accept_no_content_response);
 
         if (res) {
             transfer_details.on_success(_probe);
@@ -1466,6 +1494,8 @@ ss::future<upload_result> remote::upload_object(upload_request upload_request) {
             co_await ss::sleep_abortable(permit.delay, _as);
             permit = fib.retry();
             break;
+        case cloud_storage_clients::error_outcome::operation_not_supported:
+            [[fallthrough]];
         case cloud_storage_clients::error_outcome::key_not_found:
             [[fallthrough]];
         case cloud_storage_clients::error_outcome::fail:
@@ -1495,18 +1525,6 @@ ss::future<upload_result> remote::upload_object(upload_request upload_request) {
           upload_type);
     }
     co_return upload_result::timedout;
-}
-
-ss::sstring lazy_abort_source::abort_reason() const { return _abort_reason; }
-
-bool lazy_abort_source::abort_requested() {
-    auto maybe_abort = _predicate();
-    if (maybe_abort.has_value()) {
-        _abort_reason = *maybe_abort;
-        return true;
-    } else {
-        return false;
-    }
 }
 
 ss::future<>

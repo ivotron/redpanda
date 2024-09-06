@@ -62,6 +62,8 @@ MachineTypeMemory = {
     'im4gn.large': 8 * GiB,
     'im4gn.xlarge': 16 * GiB,
     'im4gn.8xlarge': 128 * GiB,
+    'Standard_L8s_v3': 64 * GiB,
+    'Standard_L8as_v3': 64 * GiB,
     'n2d-standard-2': 8 * GiB,
     'n2d-standard-4': 16 * GiB,
     'n2d-standard-16': 64 * GiB,
@@ -897,8 +899,14 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
 
         self.logger.info('verify operator-v2 is not activated')
         # kubectl get redpanda -n=redpanda
+        # Even when nothing is found, kubectl always exits 0.  Ref: https://github.com/kubernetes/kubectl/issues/821
+        # But when nothing is found, kubectl by default prints "No resources found in redpanda namespace." to stderr.
+        # Which gets merged into the result lines!
+        #
+        # So, we add --ignore-not-found.  This flag skips the human-readable "No resource" message.
+        # By the way, exit code is still 0, even with this flag :)
         get_redpanda = self.redpanda.kubectl.cmd(
-            ['get', 'redpanda', '-n=redpanda'])
+            ['get', 'redpanda', '-n=redpanda', '--ignore-not-found'])
         if len(get_redpanda) > 0:
             self.logger.warn('cannot run test with operator-v2')
             return
@@ -1202,8 +1210,14 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
 
         self.logger.info('verify operator-v2 is not activated')
         # kubectl get redpanda -n=redpanda
+        # Even when nothing is found, kubectl always exits 0.  Ref: https://github.com/kubernetes/kubectl/issues/821
+        # But when nothing is found, kubectl by default prints "No resources found in redpanda namespace." to stderr.
+        # Which gets merged into the result lines!
+        #
+        # So, we add --ignore-not-found.  This flag skips the human-readable "No resource" message.
+        # By the way, exit code is still 0, even with this flag :)
         get_redpanda = self.redpanda.kubectl.cmd(
-            ['get', 'redpanda', '-n=redpanda'])
+            ['get', 'redpanda', '-n=redpanda', '--ignore-not-found'])
         if len(get_redpanda) > 0:
             self.logger.warn('cannot run test with operator-v2')
             return
